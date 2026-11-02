@@ -1,0 +1,3141 @@
+/* ============================================================
+   App state
+   ============================================================ */
+/* this script runs the planning page and, with window.PAGE = "exposure", the exposure page */
+const PAGE = (typeof window !== "undefined" && window.PAGE) || "planning";
+/* the burn page is an exposure-style page with fire-weather parameters and a burn prescription */
+const BURN = PAGE === "burn";
+/* the personal forecast: any point, a title, waves when asked, and a written summary */
+const PERSONAL = PAGE === "personal";
+const EXPO = PAGE === "exposure" || BURN || PERSONAL;
+const LMEF = PAGE === "lmef";
+const LS = PERSONAL ? { edits:"persfx:v1:edits", prefs:"persfx:v1:prefs", pub:"persfx:v1:published" } : BURN ? { edits:"burnfx:v1:edits", prefs:"burnfx:v1:prefs", pub:"burnfx:v1:published" } : EXPO ? { edits:"expfx:v1:edits", prefs:"expfx:v1:prefs", pub:"expfx:v1:published" } : LMEF ? { edits:"lmfx:v1:edits", prefs:"lmfx:v1:prefs", pub:"lmfx:v1:published" } : { edits:"planfx:v1:edits", prefs:"planfx:v1:prefs", pub:"planfx:v1:published" };
+/* the LMEF page supplies its own points, parameters, rows and rule guidance through these hooks */
+const HOOKS = (typeof window !== "undefined" && (window.EDITOR_HOOKS = window.EDITOR_HOOKS || {})) || {};
+const PLANNING_PARAMS = PARAMS.map(p => ({ ...p }));
+const store = {
+  get(k, d){ try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
+  set(k, v){ try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* storage unavailable */ } },
+};
+const DEMO = /[?&]demo=1\b/.test(location.search) || !!(typeof window !== "undefined" && window.FORCE_DEMO);
+
+/* ============================================================
+   Exposure forecasts: points, constraints and valid range
+   ============================================================ */
+const EXP_POINTS = [
+  { id:"lc39a", name:"LC-39A", point:"LC-39A", area:"KSC", tag:"39A", off:[6,3,"start"],   stn:"KTTS", lat:28.6083, lon:-80.6041 },
+  { id:"lc39b", name:"LC-39B", point:"LC-39B", area:"KSC", tag:"39B", off:[0,-7,"middle"], stn:"KTTS", lat:28.6272, lon:-80.6208 },
+  { id:"slc41", name:"SLC-41", point:"SLC-41", area:"CCSFS", tag:"41",  off:[-6,3,"end"],    stn:"KXMR", lat:28.5833, lon:-80.5830 },
+  { id:"slc40", name:"SLC-40", point:"SLC-40", area:"CCSFS", tag:"40",  off:[6,4,"start"],   stn:"KXMR", lat:28.5620, lon:-80.5772 },
+  { id:"slc37", name:"SLC-37", point:"SLC-37", area:"CCSFS", tag:"37",  off:[6,3,"start"],   stn:"KXMR", lat:28.5314, lon:-80.5650 },
+  { id:"lc36",  name:"LC-36",  point:"LC-36",  area:"CCSFS", tag:"36",  off:[6,3,"start"],   stn:"KXMR", lat:28.4710, lon:-80.5378 },
+  { id:"slf",   name:"SLF",    point:"SLF",    area:"KSC Shuttle Landing Facility", tag:"SLF", off:[-5,3,"end"],    stn:"KTTS", lat:28.6150, lon:-80.6945 },
+  { id:"xmr",   name:"XMR",    point:"XMR",    area:"CCSFS Skid Strip", tag:"XMR", off:[-6,3,"end"],    stn:"KXMR", lat:28.4686, lon:-80.5667 },
+];
+const MOS_STATIONS = { KTTS:[28.6150,-80.6945], KXMR:[28.4686,-80.5667], KCOF:[28.2349,-80.6101] };
+const WIND_UNITS = { kt:1, mph:0.868976, "m/s":1.943844, "ft/s":0.592484, "km/h":0.539957 };
+/* display unit for forecast winds (stored in knots) */
+const WIND_DISP = { kt:1, mph:1.150779, "m/s":0.514444, "ft/s":1.687810, "km/h":1.852 };
+const isWind = p => p && p.unit === "kt" && p.kind === "num";
+const wfac = () => WIND_DISP[prefs.wu] || 1;
+const wuLabel = () => prefs.wu || "kt";
+const toDispW = v => v == null ? v : v*wfac();
+/* "Winds (kt)" group labels follow the display unit */
+const grpLabel = g => g.replace("Winds (kt)", `Winds (${wuLabel()})`).replace("Wind (kt)", `Wind (${wuLabel()})`);
+/* burn page: RH follows edited temperature and dew point; LDSI follows edited sky, 20 ft wind,
+   transport wind and mixing height; LVORI follows RH and LDSI. Each shifts the guidance value by the
+   change the office formula gives for the edit, so an unedited row keeps the guidance; a row edited
+   directly is never overwritten. */
+const _ceilCache = {};
+function rowCeiling(sid, r){
+  const key = `${sid}|${r.a}`; if (_ceilCache[key] !== undefined) return _ceilCache[key];
+  const G = S.G[sid], x = S.TL.idx(Math.floor(r.a/H)*H), v = [];
+  if (G) for (const src of G.src) for (const m of src.members){ const c = ceilOf(m, x); if (c != null) v.push(c); }
+  v.sort((a, b) => a - b); const c = v.length ? v[v.length >> 1] : 99999;
+  if (Object.keys(_ceilCache).length > 4000) for (const k in _ceilCache) delete _ceilCache[k];
+  return (_ceilCache[key] = c);
+}
+function burnFollow(o, g, rows, ed, sid){
+  const one = (src, i, ceil) => ({ sky:[src.sky[i]], s20:[src.s20[i]], tw:[src.tw[i]], mixh:[src.mixh[i]], cig:[ceil] });
+  rows.forEach((r, i) => {
+    /* RH from edited temperature or dew point */
+    if (o.rh && ed("rh", r) === undefined && (ed("t", r) !== undefined || ed("td", r) !== undefined) && o.t[i] != null && o.td[i] != null && g.t[i] != null && g.td[i] != null && g.rh[i] != null)
+      o.rh[i] = Math.max(1, Math.min(100, Math.round(g.rh[i] + rhFrom(o.t[i], o.td[i]) - rhFrom(g.t[i], g.td[i]))));
+    /* LDSI from edited inputs */
+    const inEd = ["sky","s20","tw","mixh"].some(k => ed(k, r) !== undefined);
+    if (o.di && ed("di", r) === undefined && inEd && ["sky","s20","tw","mixh"].every(k => o[k] && o[k][i] != null && g[k] && g[k][i] != null)){
+      const t = r.a + Math.min(r.b - r.a, H)/2, ceil = rowCeiling(sid, r);
+      const Lo = ldsi(one(o, i, ceil), 0, t), Lg = ldsi(one(g, i, ceil), 0, t);
+      /* scale by the formula's response to the edit, so the blended guidance value carries over */
+      if (Lo != null && Lg != null){ const k = g.di[i] != null && Lg > 0.5 ? Math.max(0.5, Math.min(2, g.di[i]/Lg)) : 1; o.di[i] = Math.max(0, Math.round(Lo*k)); }
+    }
+    /* LVORI from RH and LDSI */
+    if (o.lvori && ed("lvori", r) === undefined && o.rh[i] != null && o.di[i] != null && (o.rh[i] !== g.rh[i] || o.di[i] !== g.di[i]))
+      o.lvori[i] = lvori(o.rh[i], o.di[i]);
+  });
+}
+/* burn prescription criteria: field, operator, value(s) */
+const RXF = {
+  rh:    { l:"Relative humidity", short:"RH", unit:"%", key:"rh" },
+  t:     { l:"Temperature", short:"Temp", unit:"°F", key:"t" },
+  s20:   { l:"20 ft wind, sustained", short:"20 ft wind", wind:true, key:"s20" },
+  g20:   { l:"20 ft wind, peak", short:"20 ft peak", wind:true, key:"g20" },
+  dir:   { l:"20 ft wind direction", short:"Wind from", sector:true, key:"dirm", dep:"dir" },
+  tw:    { l:"Transport wind", short:"Transport", wind:true, key:"tw" },
+  mixh:  { l:"Mixing height", short:"Mixing ht", unit:"ft", key:"mixh" },
+  di:    { l:"Dispersion index (LDSI)", short:"LDSI", unit:"", key:"di" },
+  lvori: { l:"LVORI", short:"LVORI", unit:"", key:"lvori" },
+  haines:{ l:"Haines index", short:"Haines", unit:"", key:"haines" },
+};
+function burnDefaults(){
+  const d = new Date(), st = capeToUTC(d.getFullYear(), d.getMonth() + 1, d.getDate() + 1, 8, 0);
+  return { op:"", start:st, end:st + 10*H, hourly:"all", custom:{ name:"Burn unit", lat:28.66, lon:-80.70 },
+    /* an example prescription: replace with the burn plan's own limits */
+    constraints:[ { id:"r1", type:"rx", f:"rh", op:">=", v:30 }, { id:"r2", type:"rx", f:"rh", op:"<=", v:55 }, { id:"r3", type:"rx", f:"s20", op:">=", v:4, unit:"mph" }, { id:"r4", type:"rx", f:"s20", op:"<=", v:15, unit:"mph" },
+      { id:"r5", type:"rx", f:"mixh", op:">=", v:1700 }, { id:"r6", type:"rx", f:"tw", op:">=", v:9, unit:"mph" }, { id:"r7", type:"rx", f:"di", op:">=", v:21 }, { id:"r8", type:"rx", f:"lvori", op:"<=", v:4 } ] };
+}
+function persDefaults(){
+  const st = Math.ceil(Date.now()/H)*H;
+  return { op:"", title:"My Forecast", place:{ name:"Melbourne, FL", lat:28.0836, lon:-80.6081 }, tz:"America/New_York", start:st, end:st + 3*24*H, hourly:"all", marine:false, summary:null, concerns:null, gusts:[20, 25, 30], constraints:[] };
+}
+function expDefaults(){
+  if (PERSONAL) return persDefaults();
+  if (BURN) return burnDefaults();
+  const st = Math.ceil(Date.now()/H)*H;
+  return { op:"", start:st, end:st + 48*H, hourly:24, custom:{ name:"Custom point", lat:28.5, lon:-80.6 },
+    constraints:[ { id:"c1", type:"wind", h:60, kind:"peak", op:">=", v:25, unit:"kt" }, { id:"c2", type:"temp", op:"<", v:40, unit:"F" } ] };
+}
+const expStored = EXPO ? (store.get(LS.prefs, {}).exp || expDefaults()) : null;
+function expPoints(exp){
+  if (PERSONAL){ const p = exp.place || {}; return [{ id:"custom", name: p.name || "Forecast point", point: p.name || "Forecast point", tag:"P", off:[6,3,"start"], stn:null, lat:+p.lat || 28.08, lon:+p.lon || -80.61, custom:true }]; }
+  const c = exp.custom || {}; let stn = null, best = 30;
+  for (const k in MOS_STATIONS){ const d = kmBetween(+c.lat, +c.lon, MOS_STATIONS[k][0], MOS_STATIONS[k][1]); if (d < best){ best = d; stn = k; } }
+  const cust = { id:"custom", name: c.name || (BURN ? "Burn unit" : "Custom point"), point: c.name || (BURN ? "Burn unit" : "Custom"), tag:"C", off:[6,3,"start"], stn, lat:+c.lat || 28.5, lon:+c.lon || -80.6, custom:true };
+  return BURN ? [cust, ...EXP_POINTS] : [...EXP_POINTS, cust];
+}
+const fmtNum = v => (Math.round(v*10)/10).toString();
+const opText = op => ({ ">":">", ">=":"≥", "<":"<", "<=":"≤" })[op] || op;
+function rxValueText(c){ const f = RXF[c.f] || {}; if (f.sector) return `${Math.round(+c.v)}–${Math.round(+c.v2)}°`; return `${fmtNum(+c.v)}${f.wind ? " " + (c.unit || "mph") : f.unit === "%" ? "%" : f.unit === "°F" ? "°F" : f.unit ? " " + f.unit : ""}`; }
+function rxParams(exp){
+  const list = (exp.constraints || []).filter(c => RXF[c.f]).map(c => {
+    const f = RXF[c.f], vNum = f.wind ? (+c.v || 0)*(WIND_UNITS[c.unit || "mph"] || 1) : +c.v;
+    const title = f.sector ? `${f.l} from ${rxValueText(c)}` : `${f.l} ${opText(c.op)} ${rxValueText(c)}`;
+    const base = { k:"x" + c.id, g:"Prescription (%)", l: f.sector ? rxValueText(c) : `${opText(c.op)}${rxValueText(c)}`, s:f.short, chip:`${f.short} ${f.sector ? rxValueText(c) : opText(c.op) + rxValueText(c)}`, kind:"prob", title, csv:`p_${c.f}_${f.sector ? "from" + Math.round(+c.v) + "to" + Math.round(+c.v2) : (c.op === ">=" || c.op === ">" ? "ge" : "le") + fmtNum(+c.v)}_pct`, cons:c };
+    if (f.sector) return { ...base, ex:"dirm", dep:["dir"], op:"in", v:[+c.v, +c.v2], noShift:true };
+    return { ...base, ex: f.key + (c.op === ">=" || c.op === ">" ? "Lo" : "Hi"), dep:[f.key], op:c.op, v:vNum };
+  });
+  return list.length ? [{ k:"xall", g:"Prescription (%)", l:"All criteria", s:"in Rx", chip:"In prescription", kind:"prob", ex:"rx", op:">=", v:1, noShift:true, title:"Chance every prescription criterion is met", csv:"p_in_prescription_pct" }, ...list] : [];
+}
+/* the per-member test the engine runs on each row's block: every criterion met */
+function setFireRx(params){
+  const crit = params.filter(p => p.k !== "xall");
+  window.FIRE_RX = o => {
+    for (const p of crit){
+      const x = o[p.ex]; if (x == null) return null;
+      const ok = p.op === "in" ? inSector(x, p.v[0], p.v[1]) : p.op === ">=" ? x >= p.v : p.op === ">" ? x > p.v : p.op === "<=" ? x <= p.v : x < p.v;
+      if (!ok) return 0;
+    }
+    return 1;
+  };
+}
+function constraintParams(exp){
+  if (BURN) return rxParams(exp);
+  return (exp.constraints || []).map(c => {
+    if (c.type === "wind"){
+      const ft = Math.round(+c.h) || 54, kt = (+c.v || 0)*(WIND_UNITS[c.unit] || 1), key = (c.kind === "sust" ? "s" : "g") + ft;
+      return { k:"x" + c.id, g:"Constraint probability (%)", l:`${opText(c.op)}${fmtNum(+c.v)} ${c.unit}`, s:`${ft} ft ${c.kind === "sust" ? "sust" : "peak"}`, chip:`${ft} ft ${c.kind === "sust" ? "sust" : "peak"} ${opText(c.op)}${fmtNum(+c.v)}${c.unit === "kt" ? "" : " " + c.unit}`,
+        kind:"prob", ex:key, dep:[key], op:c.op, v:kt, title:`${c.kind === "sust" ? "Sustained" : "Peak"} wind at ${ft} ft ${opText(c.op)} ${fmtNum(+c.v)} ${c.unit}`, csv:`p_${c.kind}${ft}ft_${c.op === ">" ? "gt" : "ge"}${fmtNum(+c.v)}${c.unit.replace("/", "")}_pct`, cons:c, thrKt:kt, ft };
+    }
+    const f = c.unit === "C" ? (+c.v)*9/5 + 32 : +c.v, below = c.op === "<" || c.op === "<=";
+    return { k:"x" + c.id, g:"Constraint probability (%)", l:`${below ? "<" : ">"}${fmtNum(+c.v)}°${c.unit}`, s:"temp", chip:`Temp ${below ? "<" : ">"}${fmtNum(+c.v)}°${c.unit}`, kind:"prob", ex: below ? "tmin" : "tmax", dep:["t"], op: below ? "<" : ">", v:f,
+      title:`Temperature ${below ? "below" : "above"} ${fmtNum(+c.v)}°${c.unit}`, csv:`p_temp_${below ? "lt" : "gt"}${fmtNum(+c.v)}${c.unit}_pct`, cons:c };
+  });
+}
+/* the personal page: 10 m winds, gust chances, humidity, and waves when asked */
+function applyPersonalConfig(exp){
+  SITES.splice(0, SITES.length, ...expPoints(exp));
+  HEIGHTS.splice(0, HEIGHTS.length, 33);
+  const base = k => ({ ...PLANNING_PARAMS.find(p => p.k === k) });
+  const gust = (exp.gusts || [20, 25, 30]).map(v => ({ k:`xg${v}`, g:"Gust chances (%)", l:`>${v} mph`, s:"gusts", chip:`Gusts >${v}`, kind:"prob", ex:"g33", dep:["g33"], op:">", v: v*0.868976, unit:"%", step:1, lo:0, hi:100, title:`Chance of gusts over ${v} mph`, csv:`p_gust_gt${v}mph_pct` }));
+  const list = [...["sky","t","td"].map(base),
+    { k:"rh", g:"Temperature (°F)", l:"Humidity", s:"%", kind:"num", unit:"%", step:1, lo:1, hi:100, title:"Relative humidity", csv:"rh_pct" },
+    ...["pp1","pp3","pp6","lt1","lt3","lt6"].map(base),
+    { k:"s33", g:"Wind (kt)", l:"Wind", s:"10 m", kind:"num", unit:"kt", step:1, lo:0, title:"Wind speed (10 m)", csv:"wind_kt" },
+    { k:"g33", g:"Wind (kt)", l:"Gusts", s:"10 m", kind:"num", unit:"kt", step:1, lo:0, title:"Wind gusts (10 m)", peakOf:"s33", csv:"gust_kt" },
+    { ...base("dir"), g:"Wind (kt)", s:"10 m" }, ...gust,
+    ...(exp.marine ? [
+      { k:"wvh", g:"Waves and sea state", l:"Waves", s:"ft", kind:"num", unit:"ft", step:0.5, lo:0, title:"Significant wave height", csv:"wave_ft" },
+      { k:"swh", g:"Waves and sea state", l:"Swell", s:"ft", kind:"num", unit:"ft", step:0.5, lo:0, title:"Swell height", csv:"swell_ft" },
+      { k:"wvp", g:"Waves and sea state", l:"Period", s:"s", kind:"num", unit:"s", step:1, lo:0, title:"Wave period", csv:"wave_period_s" },
+      { k:"wvd", g:"Waves and sea state", l:"From", s:"°", kind:"num", unit:"°", step:10, lo:0, hi:360, title:"Wave direction (from)", csv:"wave_dir_deg" },
+      { k:"sst", g:"Waves and sea state", l:"Water", s:"°F", kind:"num", unit:"°F", step:1, title:"Water temperature", csv:"water_temp_f" }] : [])];
+  const CSVN = { sky:"sky_pct", t:"temp_f", td:"dewpoint_f", pp1:"pop_1h_pct", pp3:"pop_3h_pct", pp6:"pop_6h_pct", lt1:"ltg_1h_pct", lt3:"ltg_3h_pct", lt6:"ltg_6h_pct", dir:"wind_dir_deg" };
+  list.forEach(p => { if (CSVN[p.k]) p.csv = CSVN[p.k]; });
+  PARAMS.splice(0, PARAMS.length, ...list);
+  for (const k of Object.keys(P)) delete P[k];
+  PARAMS.forEach(p => P[p.k] = p);
+}
+/* the burn page: 20 ft winds, fire-weather rows and the prescription */
+function applyBurnConfig(exp){
+  SITES.splice(0, SITES.length, ...expPoints(exp));
+  HEIGHTS.splice(0, HEIGHTS.length, 20);
+  const rx = rxParams(exp); setFireRx(rx);
+  const base = k => ({ ...PLANNING_PARAMS.find(p => p.k === k) });
+  const thrOf = key => rx.filter(p => p.dep && p.dep[0] === key && typeof p.v === "number").map(p => Math.round(p.v));
+  const list = [...["sky","t","td"].map(base),
+    { k:"rh", g:"Temperature (°F)", l:"RH", s:"%", kind:"num", unit:"%", step:1, lo:1, hi:100, title:"Relative humidity", csv:"rh_pct" },
+    ...["pp1","pp3","pp6","lt1","lt3","lt6"].map(base),
+    { k:"s20", g:"Winds (kt)", l:"20 ft", s:"sust", kind:"num", unit:"kt", step:1, lo:0, title:"20 ft sustained wind", thr:thrOf("s20"), csv:"wind20ft_sust_kt" },
+    { k:"g20", g:"Winds (kt)", l:"20 ft", s:"peak", kind:"num", unit:"kt", step:1, lo:0, title:"20 ft peak wind", thr:thrOf("g20"), peakOf:"s20", csv:"wind20ft_peak_kt" },
+    { ...base("dir"), s:"20 ft" },
+    { k:"mixh", g:"Smoke and dispersion", l:"Mixing ht", s:"ft AGL", kind:"num", unit:"ft", step:100, lo:0, title:"Mixing height (ft above ground)", thr:thrOf("mixh"), csv:"mixing_height_ft" },
+    { k:"tw", g:"Smoke and dispersion", l:"Transport", s:"wind", kind:"num", unit:"kt", step:1, lo:0, title:"Transport wind (mean through the mixed layer)", thr:thrOf("tw"), csv:"transport_wind_kt" },
+    { k:"tdir", g:"Smoke and dispersion", l:"Transport", s:"dir", kind:"dir", title:"Transport wind direction", csv:"transport_dir_deg" },
+    { k:"vr", g:"Smoke and dispersion", l:"Ventilation", s:"m²/s", kind:"num", unit:"m²/s", step:100, lo:0, title:"Ventilation rate (mixing height × transport wind)", csv:"ventilation_m2s" },
+    { k:"di", g:"Smoke and dispersion", l:"LDSI", s:"dispersion", kind:"num", unit:"", step:1, lo:0, title:"Lavdas dispersion index (stability class from net radiation and the 20 ft wind; mixing height and transport wind)", thr:thrOf("di"), csv:"ldsi" },
+    { k:"lvori", g:"Smoke and dispersion", l:"LVORI", s:"", kind:"num", unit:"", step:1, lo:1, hi:10, title:"Low visibility occurrence risk index (MFL table from RH and LDSI)", thr:thrOf("lvori"), csv:"lvori" },
+    { k:"haines", g:"Smoke and dispersion", l:"Haines", s:"low elev.", kind:"num", unit:"", step:1, lo:2, hi:6, title:"Haines index (low elevation, 950-850 hPa)", csv:"haines" },
+    ...rx.map(p => ({ ...p, unit:"%", step:1, lo:0, hi:100 })), base("sev")];
+  const CSVN = { sky:"sky_pct", t:"temp_f", td:"dewpoint_f", pp1:"pop_1h_pct", pp3:"pop_3h_pct", pp6:"pop_6h_pct", lt1:"ltg_1h_pct", lt3:"ltg_3h_pct", lt6:"ltg_6h_pct", dir:"wind_dir_deg", sev:"spc_category" };
+  list.forEach(p => { if (CSVN[p.k]) p.csv = CSVN[p.k]; });
+  PARAMS.splice(0, PARAMS.length, ...list);
+  for (const k of Object.keys(P)) delete P[k];
+  PARAMS.forEach(p => P[p.k] = p);
+}
+/* swap in the exposure points, wind heights and parameters */
+function applyExposureConfig(exp){
+  if (PERSONAL) return applyPersonalConfig(exp);
+  if (BURN) return applyBurnConfig(exp);
+  SITES.splice(0, SITES.length, ...expPoints(exp));
+  const cons = constraintParams(exp);
+  const hs = [...new Set(cons.filter(p => p.ft).map(p => p.ft))].sort((a, b) => a - b); if (!hs.length) hs.push(54);
+  HEIGHTS.splice(0, HEIGHTS.length, ...hs);
+  const base = k => ({ ...PLANNING_PARAMS.find(p => p.k === k) });
+  const winds = hs.flatMap(ft => {
+    const thr = cons.filter(p => p.ft === ft).map(p => Math.round(p.thrKt));
+    return [ { k:"s" + ft, g:"Winds (kt)", l:`${ft} ft`, s:"sust", kind:"num", unit:"kt", step:1, lo:0, title:`${ft} ft sustained wind`, thr, csv:`wind${ft}ft_sust_kt` },
+             { k:"g" + ft, g:"Winds (kt)", l:`${ft} ft`, s:"peak", kind:"num", unit:"kt", step:1, lo:0, title:`${ft} ft peak wind`, thr, peakOf:"s" + ft, csv:`wind${ft}ft_peak_kt` } ];
+  });
+  const list = [...["sky","t","td","wbgt","pp1","pp3","pp6","lt1","lt3","lt6"].map(base), ...winds, base("dir"), ...cons.map(p => ({ ...p, unit:"%", step:1, lo:0, hi:100 })), base("sev")];
+  list.find(p => p.k === "dir").s = `${hs[0]} ft`;
+  const CSVN = { sky:"sky_pct", t:"temp_f", td:"dewpoint_f", wbgt:"wbgt_f", pp1:"pop_1h_pct", pp3:"pop_3h_pct", pp6:"pop_6h_pct", lt1:"ltg_1h_pct", lt3:"ltg_3h_pct", lt6:"ltg_6h_pct", dir:"wind_dir_deg", sev:"spc_category" };
+  list.forEach(p => { if (CSVN[p.k]) p.csv = CSVN[p.k]; });
+  PARAMS.splice(0, PARAMS.length, ...list);
+  for (const k of Object.keys(P)) delete P[k];
+  PARAMS.forEach(p => P[p.k] = p);
+}
+function constraintSummary(){
+  if (!EXPO) return "";
+  if (PERSONAL) return "";
+  if (BURN) return burnSummary();
+  const cons = constraintParams(prefs.exp || expStored);
+  return cons.length ? "Constraints: " + cons.map((p, j) => j ? p.title.charAt(0).toLowerCase() + p.title.slice(1) : p.title).join("; ") + "." : "No constraints set.";
+}
+if (EXPO) applyExposureConfig(expStored);
+if (LMEF && HOOKS.config) HOOKS.config();
+const prefs = Object.assign({ wu: BURN || PERSONAL ? "mph" : undefined, enabled:{}, weight:{}, orient:"across", tz:"L", initials:"", link:true, clamp:true, hot:{}, site:SITES[0].id, param: BURN ? "rh" : "t" }, store.get(LS.prefs, {}));
+let edits = store.get(LS.edits, {});
+if (["s54","g54"].includes(prefs.param)) prefs.param = "w54";
+if (/^(pp|lt)\d$/.test(prefs.param)) prefs.param = prefs.param.slice(0, 2);
+if (["s200","g200"].includes(prefs.param)) prefs.param = "w200";
+if (!prefs.draw) prefs.draw = "n";
+if (!prefs.cmode) prefs.cmode = "select";
+if (EXPO){ prefs.exp = Object.assign(expDefaults(), prefs.exp || {}); if (prefs.exp.end <= Date.now()){ const d = expDefaults(); prefs.exp.start = d.start; prefs.exp.end = d.end; } }
+if (!SITES.some(x => x.id === prefs.site)) prefs.site = SITES[0].id;
+delete edits["cape-pad"];   /* old SLC-40 point */
+let published = store.get(LS.pub, {});
+const S = { rows:null, TL:null, G:{}, agg:{}, status:{}, loading:true, cur:null, hoverRow:null, undo:[], redo:[], fetchedAt:null, errors:0 };
+const savePrefs = () => store.set(LS.prefs, prefs);
+const saveEdits = () => { store.set(LS.edits, edits); if (typeof LINKED !== "undefined") store.set(LINKED_KEY, LINKED); };
+const site = () => SITES.find(s => s.id === prefs.site) || SITES[0];
+const hotOf = s => prefs.hot[s.id] ?? s.hot;
+const zulu = () => prefs.tz === "Z";
+const $ = id => document.getElementById(id);
+
+function pruneEdits(){
+  const now = Date.now();
+  for (const sid in edits) for (const k in edits[sid]) for (const key in edits[sid][k]){ const [a, len] = key.split("_").map(Number); if (a + len*H < now - H) delete edits[sid][k][key]; }
+}
+function editCount(sid){ let n = 0; const e = edits[sid] || {}; for (const k in e) n += Object.keys(e[k]).length; return n; }
+
+/* ---------- guidance + official values ---------- */
+const rnd = v => v == null ? null : Math.round(v);
+/* guidance probabilities: whole percent, with 1% rounded down to 0 */
+const probRound = v => { if (v == null) return null; const r = Math.round(v); return r <= 1 ? 0 : r; };
+function guidanceFor(sid){
+  const A = S.agg[sid]; if (!A) return null;
+  const clampP = v => v == null ? v : Math.max(0, Math.min(prefs.clamp ? 99 : 100, v));
+  const g = {};
+  for (const p of PARAMS){
+    if (p.k.startsWith("x")) continue;
+    const arr = A.val[p.k] || [];
+    g[p.k] = S.rows.map((r, i) => {
+      const v = arr[i];
+      if (p.win && !probCell(S.rows[i], p.win)) return undefined;
+      if (p.kind === "prob") return v == null ? null : probRound(clampP(v));
+      if (p.kind === "dir") return v == null ? null : (Math.round(v/10)*10) % 360;
+      if (p.kind === "sev") return v || "-";
+      return rnd(v);
+    });
+  }
+  return g;
+}
+/* ---------- linked 1 / 3 / 6 hr probabilities ----------
+   Each row has a base value for its own length (1 h rows: 1 hr, 3 h blocks: 3 hr, 6 h blocks: 6 hr).
+   Longer windows are built from the base values inside them with
+     P = max + k * (1 - prod(1 - p) - max),
+   where k comes from the guidance for that window (0 = all hours the same event, 1 = independent).
+   An edit on a window is an anchor: the unedited base values inside it are scaled together to meet it.
+   "Highest 1 hr / 3 hr inside a block" cells follow the block by the guidance ratio. */
+function combProb(ps, k){ let mx = 0, q = 1; for (const p of ps){ mx = Math.max(mx, p); q *= 1 - p; } return mx + k*((1 - q) - mx); }
+function linkProbs(ev, rows, Gv, ed){
+  const K = [ev + "1", ev + "3", ev + "6"];
+  const P01 = v => v == null || v === undefined ? null : Math.max(0, Math.min(1, v/100));
+  const baseK = r => r.len === 1 ? K[0] : r.len <= 3 ? K[1] : K[2];
+  const G = k => Gv[k] || [];
+  const ratio = (kc, i) => { const gc = P01(G(kc)[i]), gb = P01(G(baseK(rows[i]))[i]); if (gc == null || gb == null || gb <= 0) return 1; return Math.min(1, gc/gb); };
+  const b = rows.map((r, i) => { const e = ed(baseK(r), r); return e !== undefined ? e/100 : P01(G(baseK(r))[i]); });
+  const fixed = rows.map((r, i) => ed(baseK(r), r) !== undefined);
+  /* anchors on "highest inside" cells set their block */
+  rows.forEach((r, i) => {
+    if (r.len === 1 || fixed[i]) return;
+    for (const kc of r.len > 3 ? [K[1], K[0]] : [K[0]]){ const a = ed(kc, r); if (a === undefined) continue; const rt = ratio(kc, i); b[i] = Math.min(1, rt > 0 ? a/100/rt : a/100); fixed[i] = true; break; }
+  });
+  const kOf = (idx, Kw, i0) => {
+    const gs = idx.map(j => P01(G(baseK(rows[j]))[j])), gw = P01(G(Kw)[i0]);
+    if (gs.some(v => v == null) || gw == null) return 0.5;
+    let mx = 0, q = 1; gs.forEach(p => { mx = Math.max(mx, p); q *= 1 - p; });
+    const ind = 1 - q; if (ind - mx < 1e-4) return 0.5;
+    return Math.max(0, Math.min(1, (gw - mx)/(ind - mx)));
+  };
+  const wins = { 3:[], 6:[] };
+  for (const L of [3, 6]){
+    const Kw = L === 3 ? K[1] : K[2];
+    spanMap(Kw).forEach((sp, i0) => {
+      if (sp.cov || sp.na || sp.s < 2) return;
+      const idx = Array.from({ length: sp.s }, (_, d) => i0 + d);
+      wins[L].push({ L, i0, idx, Kw, k: kOf(idx, Kw, i0), anchor: ed(Kw, rows[i0]) });
+    });
+  }
+  const locked = new Set();
+  const solve = w => {
+    const T = Math.min(0.995, w.anchor/100);
+    const free = w.idx.filter(j => !fixed[j] && !locked.has(j)); if (!free.length) return;
+    const base = free.map(j => b[j] || 0); if (base.every(v => v <= 0)) base.fill(0.01);
+    const val = sc => combProb(w.idx.map(j => { const m = free.indexOf(j); return m >= 0 ? Math.min(0.995, base[m]*sc) : (b[j] || 0); }), w.k);
+    let lo = 0, hi = 1; while (val(hi) < T && hi < 1e5) hi *= 2;
+    for (let it = 0; it < 48; it++){ const mid = (lo + hi)/2; if (val(mid) < T) lo = mid; else hi = mid; }
+    const sc = (lo + hi)/2; free.forEach((j, m) => b[j] = Math.min(0.995, base[m]*sc));
+  };
+  wins[3].forEach(w => { if (w.anchor !== undefined){ solve(w); w.idx.forEach(j => locked.add(j)); } });
+  wins[6].forEach(w => { if (w.anchor !== undefined) solve(w); });
+  const out = {}; K.forEach(k => out[k] = rows.map(() => undefined));
+  rows.forEach((r, i) => {
+    out[baseK(r)][i] = b[i] == null ? null : b[i]*100;
+    if (r.len > 1){ out[K[0]][i] = b[i] == null ? null : b[i]*ratio(K[0], i)*100; if (r.len > 3) out[K[1]][i] = b[i] == null ? null : b[i]*ratio(K[1], i)*100; }
+  });
+  const fit = [];
+  for (const L of [3, 6]) for (const w of wins[L]){
+    let v = combProb(w.idx.map(j => b[j] || 0), w.k)*100;
+    if (L === 6 && w.anchor === undefined){ let mx = 0; w.idx.forEach(j => { mx = Math.max(mx, (b[j] || 0)*100); const v3 = out[K[1]][j]; if (v3 != null) mx = Math.max(mx, v3); }); v = Math.max(v, mx); }
+    if (w.anchor !== undefined) fit.push({ k:w.Kw, i:w.i0, anchor:w.anchor, fit:v });
+    out[w.Kw][w.i0] = v;
+  }
+  return { out, fit };
+}
+function officialFor(sid, fast){
+  const s = SITES.find(x => x.id === sid), G = S.G[sid], g = guidanceFor(sid) || {};
+  const e = edits[sid] || {}, rows = S.rows, o = {}, src = {};
+  const ed = (k, r) => e[k] && e[k][r.key] !== undefined ? e[k][r.key] : undefined;
+  for (const p of PARAMS){
+    if (p.k.startsWith("x")) continue;
+    o[p.k] = rows.map((r, i) => { if (p.win && !probCell(r, p.win)) return undefined; const x = ed(p.k, r); return x !== undefined ? x : (g[p.k] ? g[p.k][i] : null); });
+  }
+  /* precip and lightning: keep 1, 3 and 6 hr consistent */
+  const fits = [];
+  if (prefs.linkWin !== false && S.agg[sid]){
+    for (const ev of ["pp","lt"].filter(ev => P[ev + "3"] && P[ev + "6"])){
+      const res = linkProbs(ev, rows, S.agg[sid].val, ed);
+      for (const k of [ev + "1", ev + "3", ev + "6"]){
+        o[k] = rows.map((r, i) => {
+          if (o[k][i] === undefined) return undefined;
+          const x = ed(k, r); if (x !== undefined) return x;
+          const v = res.out[k][i]; return v == null || v === undefined ? null : probRound(Math.min(prefs.clamp ? 99 : 100, v));
+        });
+      }
+      fits.push(...res.fit);
+    }
+  }
+  /* peaks follow edited sustained winds unless the peak itself is edited */
+  rows.forEach((r, i) => {
+    for (const [sk, gk] of PARAMS.filter(p => p.peakOf && o[p.peakOf]).map(p => [p.peakOf, p.k])){
+      if (ed(gk, r) !== undefined || ed(sk, r) === undefined || o[gk][i] == null || g[sk] == null || g[sk][i] == null) continue;
+      o[gk][i] = Math.max(o[sk][i], o[gk][i] + (o[sk][i] - g[sk][i]));
+    }
+  });
+  /* WBGT follows edited temperature / dew point unless WBGT itself is edited */
+  rows.forEach((r, i) => {
+    if (!o.wbgt || !g.wbgt || ed("wbgt", r) !== undefined || (ed("t", r) === undefined && ed("td", r) === undefined)) return;
+    if (o.t[i] == null || o.td[i] == null || g.t[i] == null || g.td[i] == null || g.wbgt[i] == null) return;
+    const d = wbgtF(o.t[i], o.td[i], 400, 8) - wbgtF(g.t[i], g.td[i], 400, 8);
+    o.wbgt[i] = Math.round(g.wbgt[i] + d);
+  });
+  if (BURN) burnFollow(o, g, rows, ed, sid);
+  const gx = {};
+  if (fast && OF && OF.site === sid){
+    /* while dragging: keep the exceedance probabilities from the last full pass */
+    for (const p of PARAMS.filter(p => p.k.startsWith("x"))){ o[p.k] = OF.o[p.k] || []; gx[p.k] = OF.g[p.k] || []; src[p.k] = OF.xsrc[p.k] || {}; }
+    const outF = { o, g: Object.assign(g, gx), xsrc: src, fits, site:sid };
+    if (HOOKS.official) HOOKS.official(outF, ed, rows);
+    return outF;
+  }
+  for (const p of PARAMS.filter(p => p.k.startsWith("x"))){
+    o[p.k] = []; gx[p.k] = []; src[p.k] = {};
+    rows.forEach((r, i) => {
+      let delta = 0;
+      if (prefs.link && G && g.t && p.dep){
+        const mx = (src2, ks) => { const v = ks.map(k => src2[k] ? src2[k][i] : null).filter(x => x != null); return v.length ? Math.max(...v) : null; };
+        const a = mx(o, p.dep), b = mx(g, p.dep); if (a != null && b != null) delta = a - b;
+      }
+      const clampP = v => v == null ? v : Math.max(0, Math.min(prefs.clamp ? 99 : 100, v));
+      const base = G && G.mem ? exceed(G, p.k, i, 0, hotOf(s)) : { v:null, per:{} };
+      const shifted = delta && G && G.mem ? exceed(G, p.k, i, delta, hotOf(s)) : base;
+      gx[p.k][i] = probRound(clampP(base.v));
+      for (const id in base.per) (src[p.k][id] = src[p.k][id] || [])[i] = base.per[id];
+      const x = ed(p.k, r);
+      o[p.k][i] = x !== undefined ? x : probRound(clampP(shifted.v));
+    });
+  }
+  /* burn: the chance of meeting every criterion can't exceed the chance of meeting any one of them,
+     so edits that move a single criterion carry into "All criteria" */
+  if (BURN && o.xall){
+    const crit = PARAMS.filter(p => p.k.startsWith("x") && p.k !== "xall");
+    rows.forEach((r, i) => { if (ed("xall", r) !== undefined || o.xall[i] == null) return; const lo = Math.min(...crit.map(p => o[p.k][i]).filter(v => v != null)); if (isFinite(lo)) o.xall[i] = Math.min(o.xall[i], lo); });
+  }
+  const out = { o, g: Object.assign(g, gx), xsrc: src, fits, site:sid };
+  if (HOOKS.official) HOOKS.official(out, ed, rows);
+  return out;
+}
+
+/* QC: impossible or inconsistent combinations */
+function qcIssues(sid, OF){
+  const { o } = OF, out = [], bad = {};
+  const flag = (k, i, msg) => { (bad[k] = bad[k] || {})[i] = msg; out.push({ i, k, msg }); };
+  S.rows.forEach((r, i) => {
+    if (o.t[i] != null && o.td[i] != null && o.td[i] > o.t[i]) flag("td", i, "Dew point above temperature");
+    for (const p of PARAMS.filter(p => p.peakOf)){ const sv = o[p.peakOf] && o[p.peakOf][i], gv = o[p.k] && o[p.k][i]; if (sv != null && gv != null && gv < sv) flag(p.k, i, `${p.l} peak below sustained`); }
+    for (const ev of ["pp","lt"].filter(ev => o[ev + "3"] && o[ev + "6"])){
+      const a = o[ev+"1"][i], b = o[ev+"3"][i], c = o[ev+"6"][i];
+      if (r.len === 1 && a != null && b != null && a > b) flag(ev+"3", i, (ev === "pp" ? "Precip" : "Lightning") + " 3 hr below 1 hr");
+      if (b != null && c != null && b > c) flag(ev+"6", i, (ev === "pp" ? "Precip" : "Lightning") + " 6 hr below 3 hr");
+    }
+    for (const w of ["1","3","6"].filter(w => o["lt" + w] && o["pp" + w])){ const a = o["lt" + w][i], b = o["pp" + w][i]; if (a != null && b != null && a > b + 5) flag("lt" + w, i, `Lightning ${w} hr (${a}%) is above precipitation ${w} hr (${b}%)`); }
+    for (const [lo, hi] of [["x50","x35"],["x35","x25"],["x32","x40"]]) if (o[lo] && o[hi] && o[lo][i] != null && o[hi][i] != null && o[lo][i] > o[hi][i]) flag(lo, i, `${P[lo].l} more likely than ${P[hi].l}`);
+  });
+  for (const f of OF.fits || []) if (Math.abs(f.fit - f.anchor) > 2.5) flag(f.k, f.i, `${P[f.k].title} ${f.anchor}% can't be met by the values you've set inside it (they give ${Math.round(f.fit)}%)`);
+  return { list: out, bad };
+}
+
+/* ---------- formatting ---------- */
+function fmt(p, v){
+  if (v === undefined) return "";
+  if (v == null) return "";
+  if (isWind(p)) return String(Math.round(v*wfac()));
+  if (p.kind === "sky") return skyCat(v);
+  if (p.kind === "dir") return compass(v);
+  if (p.kind === "sev") return v === "-" ? "-" : SEV_NAME[v] || v;
+  return String(v);
+}
+function tint(p, v){
+  if (v == null || v === undefined) return "";
+  if (p.kind === "prob"){ const a = Math.min(0.62, Math.max(0, v)/100*0.62); return a > 0.02 ? `background:rgba(var(--p),${a.toFixed(3)})` : ""; }
+  if (p.k === "t" || p.k === "wbgt"){ if (v >= 85) return `background:rgba(var(--hot),${Math.min(0.32,(v-84)/40).toFixed(3)})`; if (v <= 50) return `background:rgba(var(--cold),${Math.min(0.3,(51-v)/40).toFixed(3)})`; return ""; }
+  if (p.unit === "kt" && p.kind === "num"){ const a = Math.max(0, Math.min(0.4, (v - 12)/45)); return a > 0.02 ? `background:rgba(var(--hot),${a.toFixed(3)})` : ""; }
+  if (p.kind === "sky"){ const a = Math.max(0, v)/100*0.16; return a > 0.02 ? `background:rgba(120,135,150,${a.toFixed(3)})` : ""; }
+  if (p.kind === "sev" && v !== "-") return `background:rgba(var(--hot),${(0.08 + SEV.indexOf(v)*0.06).toFixed(3)})`;
+  return "";
+}
+function rowTime(r){
+  const z = zulu();
+  if (r.len === 1) return hhmm(r.a, z);
+  return hhmm(r.a, z) + "–" + hhmm(r.b, z);
+}
+function tzLabel(){ return zulu() ? "UTC" : tzAbbr(Date.now()); }
+function colLabel(p, s){ if (p.k === "xhot") return `>${hotOf(s)}°F`; return p.l; }
+
+/* ============================================================
+   Rendering: header, locator, params, sources
+   ============================================================ */
+function renderSites(){
+  $("sites").innerHTML = SITES.map(s => `<button type="button" data-site="${s.id}" aria-pressed="${s.id === prefs.site}" class="${editCount(s.id) ? "dirty" : ""}"><span class="n">${s.name}<span class="dot" title="Has edits"></span></span><span class="p">${EXPO ? (s.custom ? `${s.lat.toFixed(3)}, ${s.lon.toFixed(3)}` : s.area) : s.point}</span></button>`).join("");
+  const s = site();
+  if (EXPO){
+    const e = prefs.exp, z = zulu(), r0 = S.rows && S.rows[0], r1 = S.rows && S.rows[S.rows.length - 1];
+    if (PERSONAL){ $("where").innerHTML = `<b>${hesc(s.name)}</b> (${s.lat.toFixed(3)}, ${s.lon.toFixed(3)}) · times ${zulu() ? "UTC" : tzAbbr(r0 ? r0.a : Date.now())}`; renderLocator(); return; }
+    $("where").innerHTML = `<b>${e.op ? e.op.replace(/</g, "&lt;") : BURN ? "Burn forecast" : "Exposure forecast"}</b> at ${s.name} (${s.lat.toFixed(4)}, ${s.lon.toFixed(4)})${s.stn ? `, MOS from ${s.stn}` : ""}${r0 ? `, ${dayLabel(r0.a, z).dt} ${hhmm(r0.a, z)} to ${dayLabel(r1.b, z).dt} ${hhmm(r1.b, z)}${z ? "Z" : " " + tzAbbr(r0.a)}` : ""}`;
+  } else $("where").innerHTML = `<b>${s.name}</b>, forecast point ${s.point} (${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}), MOS from ${s.stn}`;
+  renderLocator();
+  if (!EXPO) $("hotThr").value = hotOf(s);
+}
+/* ---------- exposure setup panel ---------- */
+function dtInput(ms){ if (zulu()) return new Date(ms).toISOString().slice(0, 16); const p = lp(ms); return `${p.y}-${pad2(p.mo)}-${pad2(p.d)}T${pad2(p.h)}:${pad2(p.mi)}`; }
+function dtParse(v){
+  const m = String(v || "").match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/); if (!m) return null;
+  const base = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+  if (zulu()) return base;
+  /* wall time in the page's time zone to UTC, for any zone */
+  let t = base; for (let k = 0; k < 3; k++){ const p = lp(t); t += base - Date.UTC(p.y, p.mo - 1, p.d, p.h, p.mi); }
+  return t;
+}
+function renderExpSetup(){
+  if (PERSONAL){ renderPersSetup(); return; }
+  if (!EXPO) return;
+  const e = prefs.exp, el = document.activeElement;
+  if (el !== $("expOp")) $("expOp").value = e.op || "";
+  if (el !== $("expStart")) $("expStart").value = dtInput(e.start);
+  if (el !== $("expEnd")) $("expEnd").value = dtInput(e.end);
+  $("expTz").textContent = zulu() ? "UTC" : tzAbbr(e.start);
+  $("expHourly").value = String(e.hourly);
+  const n = Math.round((e.end - e.start)/H);
+  $("expLen").textContent = `${n} h window${S.rows ? `, ${S.rows.length} rows` : ""}`;
+  $("expCustom").hidden = prefs.site !== "custom";
+  if (!$("expCustom").contains(el)){ $("cuName").value = e.custom.name || ""; $("cuLat").value = e.custom.lat; $("cuLon").value = e.custom.lon; }
+  const sel = (id, opts, v) => `<select data-f="${id}">${opts.map(([val, lab]) => `<option value="${val}" ${String(val) === String(v) ? "selected" : ""}>${lab}</option>`).join("")}</select>`;
+  if (BURN){
+    const fields = Object.entries(RXF).map(([k, f]) => [k, f.l]);
+    $("expCons").innerHTML = e.constraints.filter(c => RXF[c.f]).length ? e.constraints.filter(c => RXF[c.f]).map(c => {
+      const f = RXF[c.f];
+      const val = f.sector ? `<label>from <input data-f="v" type="number" min="0" max="360" step="5" value="${c.v ?? 0}">°</label><label>to <input data-f="v2" type="number" min="0" max="360" step="5" value="${c.v2 ?? 90}">°</label><span class="mut">clockwise</span>`
+        : `${sel("op", [[">=","at least"],["<=","at most"]], c.op)}<input data-f="v" type="number" step="${c.f === "mixh" ? 100 : 1}" value="${c.v}">${f.wind ? sel("unit", [["mph","mph"],["kt","kt"]], c.unit || "mph") : `<span class="mut">${f.unit || ""}</span>`}`;
+      return `<div class="con" data-id="${c.id}">${sel("f", fields, c.f)}${val}<button type="button" class="x" data-del="${c.id}" aria-label="Remove">×</button></div>`;
+    }).join("") : `<p class="mut">No prescription yet. Add the burn plan's limits (humidity, winds, mixing height, transport wind, dispersion) to get the chance each one, and all together, is met.</p>`;
+    return;
+  }
+  $("expCons").innerHTML = e.constraints.length ? e.constraints.map(c => c.type === "wind"
+    ? `<div class="con" data-id="${c.id}"><span class="ct">Wind</span><label><input data-f="h" type="number" min="5" max="600" step="1" value="${c.h}"> ft</label>${sel("kind", [["peak","Peak"],["sust","Sustained"]], c.kind)}${sel("op", [[">=","≥"],[">",">"]], c.op)}<input data-f="v" type="number" min="0" step="1" value="${c.v}">${sel("unit", Object.keys(WIND_UNITS).map(u => [u, u]), c.unit)}<button type="button" class="x" data-del="${c.id}" aria-label="Remove constraint">×</button></div>`
+    : `<div class="con" data-id="${c.id}"><span class="ct">Temperature</span>${sel("op", [["<","Below"],[">","Above"]], c.op)}<input data-f="v" type="number" step="1" value="${c.v}">${sel("unit", [["F","°F"],["C","°C"]], c.unit)}<button type="button" class="x" data-del="${c.id}" aria-label="Remove constraint">×</button></div>`).join("")
+    : `<p class="mut">No constraints yet. Add a wind or temperature constraint to get its probability in the forecast.</p>`;
+}
+let expT = null;
+function expChanged(full){
+  savePrefs(); applyExposureConfig(prefs.exp); rebuildViews();
+  clearTimeout(expT); expT = setTimeout(() => { if (full) loadAll(); else rebuildGuidance(); renderExpSetup(); }, full ? 50 : 250);
+}
+/* ---------- official schedule (uploaded CSV, kept on this computer) ----------
+   One file serves both pages: "ground" rows appear on the exposure page, "launch" rows in the LMEF
+   mission list. Mission dates may not be public, so the schedule never leaves this browser except in
+   a workspace file. */
+const SCHED_KEY = "schedfx:v1:items";
+const loadSched = () => store.get(SCHED_KEY, []);
+const saveSched = x => store.set(SCHED_KEY, x);
+const SCHED_TEMPLATE = [
+  "Operation_ID,LSP,JON,Mission_Name,Vehicle,Primary_Date_Z,Primary_Window_Z,Primary_Window_Local,Primary_Date_Local,Backup_Date_Z,Backup_Date_Local,Backup_Window_Z,Backup_Window_Local,Landing,Launch_or_Ground,Location,OpEndDate_Z,OpEndTime_Z,OpNumber",
+  "1,EXAMPLE,,Example launch,Falcon 9,01-Jan-27,1200Z - 1300Z,0700L - 0800L,01-Jan-27,02-Jan-27,02-Jan-27,1200Z - 1300Z,0700L - 0800L,N/A,Launch,SLC-40,,,",
+  "2,EXAMPLE,,Example ground operation,,01-Jan-27,1300,,,,,,,,Ground,LC-39A,01-Jan-27,2100,",
+].join("\r\n") + "\r\n";
+/* local wall time at the Cape to UTC milliseconds */
+function capeToUTC(y, mo, d, h, mi){
+  let t = Date.UTC(y, mo - 1, d, h, mi);
+  for (let k = 0; k < 3; k++){
+    const p = Object.fromEntries(new Intl.DateTimeFormat("en-US", { timeZone:TZ, year:"numeric", month:"2-digit", day:"2-digit", hour:"2-digit", minute:"2-digit", hourCycle:"h23" }).formatToParts(new Date(t)).map(x => [x.type, x.value]));
+    const shown = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute);
+    t += Date.UTC(y, mo - 1, d, h, mi) - shown;
+  }
+  return t;
+}
+const MON3 = { JAN:1, FEB:2, MAR:3, APR:4, MAY:5, JUN:6, JUL:7, AUG:8, SEP:9, OCT:10, NOV:11, DEC:12 };
+function parseWhen(v, zone){
+  v = String(v || "").trim(); if (!v) return null;
+  /* range schedule exports: "01-Nov-26 1345" (date and HHMM, usually Zulu) */
+  const dm = v.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{2,4})[ T]?(\d{2}):?(\d{2})$/);
+  if (dm && MON3[dm[2].toUpperCase()]){
+    let y = +dm[3]; if (y < 100) y += 2000;
+    const mo = MON3[dm[2].toUpperCase()], d = +dm[1], h = +dm[4], mi = +dm[5];
+    return /^(z|utc|gmt|zulu)$/i.test(String(zone || "").trim()) ? Date.UTC(y, mo - 1, d, h, mi) : capeToUTC(y, mo, d, h, mi);
+  }
+  if (/[zZ]$|[+-]\d\d:?\d\d$/.test(v) && !isNaN(Date.parse(v.replace(" ", "T")))) return Date.parse(v.replace(" ", "T"));
+  let m = v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):?(\d{2})/) || null, y, mo, d, h, mi;
+  if (m){ [y, mo, d, h, mi] = m.slice(1).map(Number); }
+  else if ((m = v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})[ T](\d{1,2}):?(\d{2})/))){ [mo, d, y, h, mi] = m.slice(1).map(Number); if (y < 100) y += 2000; }
+  else return null;
+  const utc = /^(z|utc|gmt|zulu)$/i.test(String(zone || "").trim());
+  return utc ? Date.UTC(y, mo - 1, d, h, mi) : capeToUTC(y, mo, d, h, mi);
+}
+/* pad or point named anywhere in a row's text (the range exports give the range, e.g. "ER", as location) */
+const PAD_WORDS = [[/\b39\s*-?\s*A\b|LC-?39A/i, "LC-39A"], [/\b39\s*-?\s*B\b|LC-?39B/i, "LC-39B"], [/SLC-?\s*40\b/i, "SLC-40"], [/SLC-?\s*41\b/i, "SLC-41"], [/SLC-?\s*37\b/i, "SLC-37"], [/LC-?\s*36\b/i, "LC-36"], [/SLC-?\s*46\b/i, "SLC-46"], [/\bSLF\b|SHUTTLE LANDING/i, "SLF"], [/\bXMR\b|SKID STRIP/i, "XMR"]];
+const padFromText = t => { for (const [re, p] of PAD_WORDS) if (re.test(t || "")) return p; return ""; };
+/* vehicle named in the operation name (the range exports have no vehicle column) */
+const VEHICLE_WORDS = [[/FALCON\s*HEAVY/i, "Falcon Heavy"], [/FALCON\s*9|\bF9\b/i, "Falcon 9"], [/VULCAN/i, "Vulcan"], [/ATLAS\s*V/i, "Atlas V"], [/NEW\s*GLENN/i, "New Glenn"], [/\bSLS\b/i, "SLS"], [/STARSHIP/i, "Starship"], [/NEUTRON/i, "Neutron"]];
+const vehicleFromText = t => { for (const [re, v] of VEHICLE_WORDS) if (re.test(t || "")) return v; return ""; };
+function parseSchedCSV(text, defaultType){
+  const lines = text.replace(/\r/g, "").split("\n").filter(l => l.trim() && !l.startsWith("#"));
+  const split = l => { const out = []; let cur = "", q = false; for (let i = 0; i < l.length; i++){ const ch = l[i]; if (q){ if (ch === '"' && l[i + 1] === '"'){ cur += '"'; i++; } else if (ch === '"') q = false; else cur += ch; } else if (ch === '"') q = true; else if (ch === ","){ out.push(cur); cur = ""; } else cur += ch; } out.push(cur); return out.map(x => x.trim()); };
+  const head = split(lines[0] || "").map(h => h.toLowerCase().replace(/[^a-z0-9]+/g, "_"));
+  const col = (r, ...names) => { for (const n of names){ const i = head.indexOf(n); if (i >= 0 && r[i] != null && r[i] !== "") return r[i]; } return ""; };
+  const items = [], errors = [];
+  lines.slice(1).forEach((l, n) => {
+    const r = split(l);
+    /* combined range export (launch and ground ops in one file): Zulu date plus "HHMMZ - HHMMZ"
+       windows for launches, or a start time and an end date and time for ground ops */
+    if (head.includes("launch_or_ground") || head.includes("primary_date_z")){
+      const it = parseAllOpsRow(r, col, n + 2, errors); if (it) items.push(it); return;
+    }
+    /* range export: separate Zulu date and time columns */
+    const rangeFmt = head.includes("opstartdate_z");
+    const zone = rangeFmt ? "Z" : col(r, "time_zone", "tz", "zone");
+    const tcol = col(r, "type", "kind");
+    const type = tcol ? (/^(launch|lmef|mission)$/i.test(tcol) ? "launch" : "ground") : (defaultType || "ground");
+    const name = col(r, "name", "op_name", "mission", "mission_name", "operation", "op");
+    const a = rangeFmt ? parseWhen(`${col(r, "opstartdate_z")} ${col(r, "opstarttime_z").padStart(4, "0")}`, "Z") : parseWhen(col(r, "start", "window_open", "open", "start_time"), zone);
+    const b = rangeFmt ? parseWhen(`${col(r, "openddate_z") || col(r, "opstartdate_z")} ${col(r, "opendtime_z").padStart(4, "0")}`, "Z") : parseWhen(col(r, "end", "window_close", "close", "end_time"), zone);
+    if (!name || a == null){ errors.push(`row ${n + 2}: needs a name and a start time`); return; }
+    const ba = parseWhen(col(r, "backup_start", "backup_open"), zone), bb = parseWhen(col(r, "backup_end", "backup_close"), zone);
+    const opid = col(r, "operation_id", "op_id", "id"), comments = col(r, "op_comments", "comments", "notes");
+    let location = col(r, "location", "pad", "point", "site");
+    if (!EXP_POINTS_NAMES().has(normLoc(location))) location = padFromText(`${name} ${comments}`) || (location && !/^(ER|WR|CCSFS|KSC)$/i.test(location) ? location : "");
+    items.push({ id: opid ? `sched:op:${opid}` : `sched:${type}:${name}:${a}`, type, name, provider: col(r, "lsp_name", "provider", "customer"), jon: col(r, "jon"), opnum: col(r, "opnumber", "op_number"),
+      modified: Date.parse(col(r, "lastmodified", "last_modified")) || null,
+      vehicle: col(r, "vehicle", "rocket") || vehicleFromText(name), location,
+      a, b: b != null && b > a ? b : a + (type === "launch" ? 0 : 4*H), backup: ba != null ? { a:ba, b: bb != null && bb > ba ? bb : ba + ((b || a) - a) } : null,
+      template: col(r, "template"), limit: +col(r, "liftoff_limit_kt", "liftoff_limit") || null,
+      lat: +col(r, "lat", "latitude") || null, lon: +col(r, "lon", "longitude") || null, notes: comments });
+  });
+  return { items, errors };
+}
+/* one row of the combined ops export */
+function parseAllOpsRow(r, col, rowNo, errors){
+  const type = /launch/i.test(col(r, "launch_or_ground", "type")) ? "launch" : "ground";
+  const name = (col(r, "mission_name", "op_name", "name") || "").trim();
+  const win = (date, w) => {
+    /* "1223Z - 1322Z" (a window) or "1200" (a start time); a close earlier than the open is the next day */
+    const m = String(w || "").match(/(\d{3,4})\s*Z?\s*(?:-|–|to)\s*(\d{3,4})\s*Z?/i), one = String(w || "").match(/^\s*(\d{3,4})\s*Z?\s*$/i);
+    if (!date || (!m && !one)) return null;
+    const a = parseWhen(`${date} ${(m ? m[1] : one[1]).padStart(4, "0")}`, "Z"); if (a == null) return null;
+    if (!m) return { a, b:null };
+    let b = parseWhen(`${date} ${m[2].padStart(4, "0")}`, "Z"); if (b != null && b <= a) b += 24*H;
+    return { a, b };
+  };
+  const pri = win(col(r, "primary_date_z", "opstartdate_z"), col(r, "primary_window_z", "opstarttime_z"));
+  if (!name || !pri){ errors.push(`row ${rowNo}: needs a name, a Zulu date and a window or start time`); return null; }
+  let b = pri.b;
+  if (b == null){ const e = col(r, "openddate_z"), et = col(r, "opendtime_z"); b = e && et ? parseWhen(`${e} ${et.padStart(4, "0")}`, "Z") : null; }
+  if (b == null || b <= pri.a) b = pri.a + (type === "launch" ? 0 : 4*H);
+  const bk = win(col(r, "backup_date_z"), col(r, "backup_window_z"));
+  const opid = col(r, "operation_id", "op_id", "id"), landing = col(r, "landing");
+  let location = col(r, "location", "pad", "site");
+  if (!EXP_POINTS_NAMES().has(normLoc(location))) location = padFromText(name) || (location && !/^(ER|WR|CCSFS|KSC)$/i.test(location) ? location : "");
+  return { id: opid ? `sched:op:${opid}` : `sched:${type}:${name}:${pri.a}`, type, name, provider: col(r, "lsp", "lsp_name"), jon: col(r, "jon"), opnum: col(r, "opnumber", "op_number"),
+    vehicle: col(r, "vehicle") || vehicleFromText(name), location, landing: landing && !/^n\/?a$/i.test(landing) ? landing : "",
+    a: pri.a, b, backup: bk ? { a:bk.a, b: bk.b != null ? bk.b : bk.a + (b - pri.a) } : null, template:"", limit:null, lat:null, lon:null, notes:"" };
+}
+const normLoc = v => String(v || "").toUpperCase().replace(/[^A-Z0-9]/g, "").replace(/^(LC|SLC|PAD)/, "");
+const EXP_POINTS_NAMES = () => new Set(["39A","39B","40","41","37","36","46","SLF","XMR","KXMR","KTTS","KCOF","PATRICK"].concat(typeof EXP_POINTS !== "undefined" ? EXP_POINTS.flatMap(p => [normLoc(p.point), normLoc(p.name), normLoc(p.tag)]) : []));
+function schedUpload(file, after, defaultType){
+  file.text().then(t => {
+    /* a file named for launch or non-launch ops sets the kind of every row that doesn't say */
+    const nm = file.name || "", dt = /non[-_ ]?launch/i.test(nm) ? "ground" : /launch/i.test(nm) ? "launch" : defaultType;
+    const { items, errors } = parseSchedCSV(t, dt);
+    if (!items.length){ toast(errors[0] ? `Schedule not loaded: ${errors[0]}` : "No schedule rows found"); return; }
+    /* a newer copy of the same operation replaces the old one */
+    const keep = loadSched().filter(x => !items.some(y => y.id === x.id && (!x.modified || !y.modified || y.modified >= x.modified)) && x.b > Date.now() - 2*86400e3);
+    saveSched([...keep, ...items].sort((p, q) => p.a - q.a));
+    toast(`Schedule loaded: ${items.filter(x => x.type === "launch").length} launch${items.filter(x => x.type === "launch").length === 1 ? "" : "es"}, ${items.filter(x => x.type === "ground").length} ground operation${items.filter(x => x.type === "ground").length === 1 ? "" : "s"}${errors.length ? `; ${errors.length} row${errors.length === 1 ? "" : "s"} skipped` : ""}`);
+    if (after) after();
+  });
+}
+/* exposure page: the scheduled ground operations */
+function renderSchedExpo(){
+  if (!EXPO || !$("schSel")) return;
+  const list = loadSched().filter(x => x.type === "ground" && x.b > Date.now() - 6*H);
+  $("schSel").innerHTML = `<option value="">${list.length ? "Choose a scheduled operation" : "No scheduled operations loaded"}</option>` + list.map(x => { const f = t => new Date(t).toLocaleString("en-US", { timeZone:TZ, month:"short", day:"numeric", hour:"2-digit", minute:"2-digit", hourCycle:"h23" }); return `<option value="${hesc(x.id)}">${x.a < Date.now() ? "Under way, to " + hesc(f(x.b)) : hesc(f(x.a))}L · ${x.provider ? hesc(x.provider) + " · " : ""}${hesc(x.name)}${x.location ? " · " + hesc(x.location) : ""}</option>`; }).join("");
+  $("schClear").hidden = !loadSched().length;
+}
+function useSchedExpo(id){
+  const x = loadSched().find(y => y.id === id); if (!x){ toast("Pick a scheduled operation first"); return; }
+  const e = prefs.exp;
+  const t = x.template ? loadTpls().find(q => q.name.toLowerCase() === x.template.toLowerCase()) : null;
+  if (t) applyTpl(t); else if (x.template) toast(`No saved template called "${x.template}"; times and point set, constraints unchanged`);
+  e.op = x.name; e.start = Math.max(Math.floor(x.a/H)*H, Math.floor(Date.now()/H)*H); e.end = Math.max(e.start + H, Math.ceil(x.b/H)*H);
+  if (e.end - e.start > 7*24*H){ e.end = e.start + 7*24*H; setTimeout(() => toast(`${x.name} runs past the 7-day forecast; the window covers the next 7 days`), 2200); }
+  else if (x.a < e.start) setTimeout(() => toast(`${x.name} is already under way; the window starts now`), 2200);
+  let full = false;
+  if (x.lat && x.lon){ e.custom = { name: x.location || x.name, lat:x.lat, lon:x.lon }; prefs.site = "custom"; full = true; }
+  else if (x.location){ const nl = normLoc(x.location); const s2 = EXP_POINTS.find(p => normLoc(p.point) === nl || normLoc(p.name) === nl || normLoc(p.id) === nl || normLoc(p.tag) === nl); if (s2) prefs.site = s2.id; else toast(`Location "${x.location}" not recognised; choose the point`); }
+  else setTimeout(() => toast(`${x.name}: the schedule gives no pad, so choose the point`), 1600);
+  $("expOp").value = e.op;
+  expChanged(true); renderSites();
+  toast(`Loaded ${x.name} from the official schedule`);
+}
+/* ---------- operation templates (exposure page) ----------
+   A template keeps the operation name, point, constraints, hourly setting and window length.
+   Loading one keeps the current start time. Templates live in this browser (and travel with a
+   workspace file); Export / Import shares them as a JSON file. */
+const TPL_KEY = BURN ? "burnfx:v1:templates" : "expfx:v1:templates";
+const loadTpls = () => store.get(TPL_KEY, []);
+const saveTpls = t => store.set(TPL_KEY, t);
+function renderTpls(sel){
+  if (!EXPO) return;
+  const t = loadTpls().sort((a, b) => a.name.localeCompare(b.name));
+  $("tplSel").innerHTML = `<option value="">${t.length ? "Choose a saved operation" : "No templates saved yet"}</option>` + t.map(x => `<option value="${x.id}" ${x.id === sel ? "selected" : ""}>${hesc(x.name)}</option>`).join("");
+}
+function tplFromCurrent(name){
+  const e = prefs.exp, s = SITES.find(x => x.id === prefs.site);
+  return { id:"t" + Date.now().toString(36), name, op:e.op || name, site:prefs.site, custom: s && s.custom ? { ...e.custom } : null,
+    constraints: e.constraints.map(c => { const { id, ...rest } = c; return rest; }), hourly:e.hourly, hours:Math.round((e.end - e.start)/H), saved:Date.now() };
+}
+function applyTpl(t){
+  const e = prefs.exp, newId = k => "c" + Date.now().toString(36) + k;
+  e.op = t.op || t.name;
+  e.constraints = (t.constraints || []).map((c, k) => ({ id:newId(k), ...c }));
+  if (t.hourly != null) e.hourly = t.hourly;
+  if (t.hours) e.end = e.start + t.hours*H;
+  let full = false;
+  if (t.site === "custom" && t.custom){ const was = JSON.stringify(e.custom); e.custom = { ...t.custom }; full = JSON.stringify(e.custom) !== was; }
+  if (t.site) prefs.site = t.site;
+  toast(`Loaded "${t.name}"`);
+  expChanged(full); renderSites();
+}
+function bindTpls(){
+  renderTpls();
+  $("tplLoad").onclick = () => { const t = loadTpls().find(x => x.id === $("tplSel").value); if (!t){ toast("Pick a template first"); return; } applyTpl(t); };
+  $("tplSel").ondblclick = () => $("tplLoad").click();
+  $("tplSave").onclick = () => {
+    const name = ($("tplName").value || prefs.exp.op || "").trim(); if (!name){ toast("Give the template a name"); $("tplName").focus(); return; }
+    const all = loadTpls(), same = all.find(x => x.name.toLowerCase() === name.toLowerCase());
+    if (same && !confirm(`Replace the saved template "${same.name}"?`)) return;
+    const t = tplFromCurrent(name); if (same) t.id = same.id;
+    saveTpls([...all.filter(x => x !== same), t]); renderTpls(t.id); $("tplName").value = ""; toast(`Saved "${name}"`);
+  };
+  $("tplName").addEventListener("keydown", e => { if (e.key === "Enter") $("tplSave").click(); });
+  $("tplDel").onclick = () => { const all = loadTpls(), t = all.find(x => x.id === $("tplSel").value); if (!t){ toast("Pick a template to delete"); return; } if (!confirm(`Delete the template "${t.name}"?`)) return; saveTpls(all.filter(x => x !== t)); renderTpls(); toast("Template deleted"); };
+  $("tplExport").onclick = () => { const all = loadTpls(); if (!all.length){ toast("No templates to export"); return; } download(new Blob([JSON.stringify({ kind:"erwx-exposure-templates", version:1, templates:all }, null, 1)], { type:"application/json" }), `Exposure_Templates_${(prefs.initials || "team").toUpperCase()}.json`); };
+  $("tplImport").onchange = async e => {
+    const f = e.target.files[0]; if (!f) return; e.target.value = "";
+    try {
+      const j = JSON.parse(await f.text()), inc = Array.isArray(j) ? j : j.templates;
+      if (!Array.isArray(inc)) throw new Error("bad");
+      const all = loadTpls(); let n = 0;
+      for (const t of inc){ if (!t || !t.name || !Array.isArray(t.constraints)) continue; const i = all.findIndex(x => x.name.toLowerCase() === t.name.toLowerCase()); const nt = { ...t, id: i >= 0 ? all[i].id : "t" + Date.now().toString(36) + n }; if (i >= 0) all[i] = nt; else all.push(nt); n++; }
+      saveTpls(all); renderTpls(); toast(`Imported ${n} template${n === 1 ? "" : "s"}`);
+    } catch (err) { toast("That isn't a templates file"); }
+  };
+}
+/* ---------- personal page: setup, place search, map, summary ---------- */
+const mph = kt => kt == null ? null : kt*1.150779;
+function persSetupHTML(){
+  return `<section class="panel persset" id="persSetup" aria-label="Forecast setup">
+    <div class="psrow"><label class="grow">Title <input id="pTitle" maxlength="80" placeholder="e.g. Paul's Fishing Forecast" autocomplete="off"></label></div>
+    <div class="psrow">
+      <label class="grow">Find a place <span class="pfind"><input id="pFind" placeholder="Town, city, park, marina…" autocomplete="off"><button class="btn" type="button" id="pFindGo">Search</button></span></label>
+      <label>Latitude <input id="pLat" inputmode="decimal" style="width:110px"></label><label>Longitude <input id="pLon" inputmode="decimal" style="width:110px"></label>
+      <button class="btn" type="button" id="pUseLL">Use these</button><button class="btn" type="button" id="pMapBtn">Pick on a map</button>
+    </div>
+    <div id="pResults" class="presults" hidden></div>
+    <div id="pMapWrap" hidden><div id="pMap"></div><p class="mut">Click the map to set the forecast point.</p></div>
+    <div class="psrow"><label class="grow">Place name <input id="pName" maxlength="60" autocomplete="off"></label><span class="mut" id="pTz"></span></div>
+    <div class="psrow">
+      <label>Start <input id="pStart" type="datetime-local"></label><label>End <input id="pEnd" type="datetime-local"></label>
+      <span class="seg" id="pQuick" role="group" aria-label="Quick range"><button type="button" data-h="24">24 h</button><button type="button" data-h="72">3 days</button><button type="button" data-h="120">5 days</button><button type="button" data-h="168">7 days</button></span>
+      <span class="seg" id="pStep" role="group" aria-label="Rows"><button type="button" data-step="all">Hourly</button><button type="button" data-step="0">3-hourly</button></span>
+      <label class="chk"><input type="checkbox" id="pMarine"> Waves and sea state (on the water)</label>
+    </div>
+  </section>
+  <section class="panel perssum" id="persSum" aria-label="Summary">
+    <div class="psh"><h3>Summary</h3><span class="mut" id="pSumState"></span><span class="sp"></span><button class="btn ghost" type="button" id="pSumReset">Rewrite from the forecast</button></div>
+    <label class="col">Main concerns <span class="mut">one per line</span><textarea id="pConc" rows="3"></textarea></label>
+    <label class="col">Discussion<textarea id="pDisc" rows="5"></textarea></label>
+  </section>`;
+}
+/* a written summary from the official forecast: highs and lows, rain and thunder, wind and gusts, waves */
+function persSummaryAuto(){
+  const s = site(); if (!s || !S.rows || !S.G[s.id]) return { concerns:[], text:"" };
+  const OFs = officialFor(s.id), o = OFs.o, rows = S.rows, e = prefs.exp, z = zulu();
+  const when = i => { const r = rows[i], d = dayLabel(r.a, z); return `${d.wd} ${hhmm(r.a, z).slice(0, 2) === "00" ? "midnight" : fmtHour(r.a)}`; };
+  const fmtHour = t => { const p = lp(t), h = p.h % 12 || 12; return `${h}${p.h < 12 ? " am" : " pm"}`; };
+  const idxMax = a => { let k = -1; (a || []).forEach((v, i) => { if (v != null && (k < 0 || v > a[k])) k = i; }); return k; };
+  const idxMin = a => { let k = -1; (a || []).forEach((v, i) => { if (v != null && (k < 0 || v < a[k])) k = i; }); return k; };
+  const pk = o.pp1 && o.pp1.some(v => v != null) ? "pp1" : "pp3", lk = o.lt1 && o.lt1.some(v => v != null) ? "lt1" : "lt3";
+  const hi = idxMax(o.t), lo = idxMin(o.t), ppi = idxMax(o[pk]), lti = idxMax(o[lk]), gi = idxMax(o.g33), si = idxMax(o.s33);
+  const sky = (o.sky || []).filter(v => v != null), skyAvg = sky.length ? sky.reduce((a, b) => a + b, 0)/sky.length : null;
+  const conc = [], parts = [];
+  if (skyAvg != null) parts.push(skyAvg < 25 ? "Mostly sunny to clear" : skyAvg < 55 ? "A mix of sun and clouds" : skyAvg < 80 ? "Mostly cloudy at times" : "Cloudy");
+  if (hi >= 0 && lo >= 0) parts.push(`temperatures from about ${Math.round(o.t[lo])}°F (${when(lo)}) to ${Math.round(o.t[hi])}°F (${when(hi)})`);
+  let text = parts.length ? parts.join(", ") + "." : "";
+  const pp = ppi >= 0 ? o[pk][ppi] : null;
+  if (pp != null){
+    if (pp >= 60){ text += ` Rain is likely, with the best chance (${Math.round(pp)}%) around ${when(ppi)}.`; conc.push(`Rain likely around ${when(ppi)} (${Math.round(pp)}%)`); }
+    else if (pp >= 30){ text += ` There's a chance of rain, highest (${Math.round(pp)}%) around ${when(ppi)}.`; conc.push(`Chance of rain around ${when(ppi)} (${Math.round(pp)}%)`); }
+    else text += " Rain chances stay low.";
+  }
+  const lt = lti >= 0 ? o[lk][lti] : null;
+  if (lt != null && lt >= 15){ text += ` Thunderstorms are possible (${Math.round(lt)}% around ${when(lti)}); head indoors at the first rumble.`; conc.push(`Thunderstorms possible around ${when(lti)} (${Math.round(lt)}%)`); }
+  if (si >= 0){
+    const sm = Math.round(mph(o.s33[si])), gm = gi >= 0 ? Math.round(mph(o.g33[gi])) : null, d = o.dir && o.dir[si] != null ? compassWord(o.dir[si]) : "";
+    text += ` Winds peak around ${sm} mph${d ? ` from the ${d}` : ""}${gm ? ` with gusts near ${gm} mph` : ""} around ${when(si)}.`;
+    const g = (e.gusts || [20, 25, 30]).slice().sort((a, b) => b - a);
+    for (const v of g){ const a = o[`xg${v}`]; const k = idxMax(a); if (k >= 0 && a[k] >= 40){ conc.push(`Gusts over ${v} mph likely around ${when(k)} (${Math.round(a[k])}%)`); break; } if (k >= 0 && a[k] >= 20 && v <= 25){ conc.push(`Some chance of gusts over ${v} mph around ${when(k)} (${Math.round(a[k])}%)`); break; } }
+  }
+  if (e.marine && o.wvh){
+    const wi = idxMax(o.wvh), wl = idxMin(o.wvh);
+    if (wi >= 0){ const per = o.wvp && o.wvp[wi] != null ? `, ${Math.round(o.wvp[wi])} s` : ""; { const lo2 = Math.round(o.wvh[wl]*2)/2, hi2 = Math.round(o.wvh[wi]*2)/2; text += hi2 - lo2 < 1 ? ` Seas around ${hi2} ft${per}.` : ` Seas run ${lo2}–${hi2} ft${per}, highest around ${when(wi)}.`; }
+      if (o.wvh[wi] >= 4) conc.push(`Seas up to ${Math.round(o.wvh[wi])} ft around ${when(wi)}`); }
+    const st = (o.sst || []).filter(v => v != null); if (st.length) text += ` Water temperature near ${Math.round(st[0])}°F.`;
+  }
+  if (hi >= 0 && o.t[hi] >= 95) conc.push(`Heat: highs near ${Math.round(o.t[hi])}°F`);
+  if (lo >= 0 && o.t[lo] <= 32) conc.push(`Freezing temperatures (${Math.round(o.t[lo])}°F) around ${when(lo)}`);
+  if (!conc.length) conc.push("No significant weather concerns");
+  return { concerns:conc, text:text.trim() };
+}
+const compassWord = d => ["north","north-northeast","northeast","east-northeast","east","east-southeast","southeast","south-southeast","south","south-southwest","southwest","west-southwest","west","west-northwest","northwest","north-northwest"][Math.round(((d % 360) + 360) % 360/22.5) % 16];
+/* what the products carry: the forecaster's text once edited, otherwise the automatic one */
+function persSummary(){ const a = persSummaryAuto(), e = prefs.exp; return { concerns: e.concerns != null ? e.concerns : a.concerns, text: e.summary != null ? e.summary : a.text, edited: e.summary != null || e.concerns != null }; }
+function renderPersSummary(){
+  if (!PERSONAL || !$("pDisc")) return;
+  const sm = persSummary(), ae = document.activeElement;
+  if (ae !== $("pConc")) $("pConc").value = sm.concerns.join("\n");
+  if (ae !== $("pDisc")) $("pDisc").value = sm.text;
+  $("pSumState").textContent = sm.edited ? "edited by you" : "written from the forecast; edit it as you like";
+  $("pSumReset").hidden = !sm.edited;
+}
+function renderPersSetup(){
+  const e = prefs.exp, ae = document.activeElement, set = (id, v) => { if ($(id) !== ae) $(id).value = v ?? ""; };
+  set("pTitle", e.title); set("pName", e.place && e.place.name); set("pLat", e.place && (+e.place.lat).toFixed(4)); set("pLon", e.place && (+e.place.lon).toFixed(4));
+  set("pStart", dtInput(e.start)); set("pEnd", dtInput(e.end)); $("pMarine").checked = !!e.marine;
+  document.querySelectorAll("#pStep button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.step) === String(e.hourly === "all" ? "all" : "0")));
+  $("pTz").textContent = `Time zone: ${e.tz || TZ}`;
+}
+/* the point's time zone (Open-Meteo answers with it for any coordinates) */
+async function tzAt(lat, lon){ try { const js = await getJSON(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&timezone=auto&forecast_days=1&hourly=temperature_2m`, 10000); return js.timezone || null; } catch (e) { return null; } }
+async function setPlace(lat, lon, name, tz){
+  const e = prefs.exp; lat = +lat; lon = +lon;
+  if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180){ toast("Latitude and longitude don't look right"); return; }
+  e.place = { name: name || `${lat.toFixed(3)}, ${lon.toFixed(3)}`, lat, lon };
+  const zone = tz || (DEMO ? e.tz : await tzAt(lat, lon)) || e.tz;
+  const moved = zone && zone !== (e.tz || TZ); e.tz = zone; e.summary = null; e.concerns = null;
+  if (moved){ savePrefs(); toast(`Switching to ${zone} time`); setTimeout(() => location.reload(), 600); return; }
+  expChanged(true); renderPersSetup();
+}
+let PMAP = null;
+function loadLeaflet(){
+  if (window.L && window.L.map) return Promise.resolve();
+  return new Promise((ok, bad) => {
+    const css = document.createElement("link"); css.rel = "stylesheet"; css.href = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"; document.head.appendChild(css);
+    const js = document.createElement("script"); js.src = "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"; js.onload = ok; js.onerror = bad; document.head.appendChild(js);
+  });
+}
+async function openMap(){
+  $("pMapWrap").hidden = false;
+  try { await loadLeaflet(); } catch (e) { $("pMapWrap").innerHTML = '<p class="mut">The map couldn\'t load (offline?). Enter latitude and longitude instead.</p>'; return; }
+  const p = prefs.exp.place;
+  if (!PMAP){
+    PMAP = window.L.map("pMap").setView([p.lat, p.lon], 9);
+    window.L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom:18, attribution:"© OpenStreetMap contributors" }).addTo(PMAP);
+    PMAP._mk = window.L.marker([p.lat, p.lon]).addTo(PMAP);
+    PMAP.on("click", ev => { PMAP._mk.setLatLng(ev.latlng); setPlace(ev.latlng.lat, ev.latlng.lng, `Point at ${ev.latlng.lat.toFixed(3)}, ${ev.latlng.lng.toFixed(3)}`); });
+  } else { PMAP.invalidateSize(); PMAP.setView([p.lat, p.lon]); PMAP._mk.setLatLng([p.lat, p.lon]); }
+}
+function bindPersonal(){
+  const host = $("expSetup"); host.insertAdjacentHTML("beforebegin", persSetupHTML()); host.hidden = true;
+  ["sites", "linkBar", "recentPanel", "locator"].forEach(id => { if ($(id)){ $(id).hidden = true; $(id).style.display = "none"; } });
+  $("pageTitle").textContent = prefs.exp.title || "Forecast"; document.title = `${prefs.exp.title || "Forecast"} | Weather`;
+  $("pTitle").oninput = ev => { prefs.exp.title = ev.target.value; savePrefs(); $("pageTitle").textContent = ev.target.value || "Forecast"; document.title = `${ev.target.value || "Forecast"} | Weather`; renderSites(); };
+  $("pName").oninput = ev => { prefs.exp.place.name = ev.target.value; savePrefs(); SITES[0].name = SITES[0].point = ev.target.value || "Forecast point"; renderSites(); };
+  const find = async () => {
+    const q = $("pFind").value.trim(); if (!q) return;
+    const box = $("pResults"); box.hidden = false; box.innerHTML = '<p class="mut">Searching…</p>';
+    try {
+      const res = DEMO ? [{ name:q, area:"Demo", lat:28.0836, lon:-80.6081 }] : await geocode(q);
+      box.innerHTML = res.length ? res.map((r, i) => `<button type="button" class="pres" data-i="${i}"><b>${hesc(r.name)}</b> <span class="mut">${hesc(r.area)} · ${r.lat.toFixed(3)}, ${r.lon.toFixed(3)}</span></button>`).join("") : '<p class="mut">No places found. Try a nearby town, or enter latitude and longitude.</p>';
+      box.onclick = ev => { const b = ev.target.closest("[data-i]"); if (!b) return; const r = res[+b.dataset.i]; box.hidden = true; setPlace(r.lat, r.lon, r.area ? `${r.name}, ${r.area.split(", ")[0]}` : r.name, r.tz); };
+    } catch (err) { box.innerHTML = '<p class="mut">Place search isn\'t reachable right now. Enter latitude and longitude instead.</p>'; }
+  };
+  $("pFindGo").onclick = find; $("pFind").onkeydown = ev => { if (ev.key === "Enter"){ ev.preventDefault(); find(); } };
+  $("pUseLL").onclick = () => setPlace($("pLat").value, $("pLon").value, $("pName").value && $("pName").value !== prefs.exp.place.name ? $("pName").value : null);
+  $("pMapBtn").onclick = () => { if ($("pMapWrap").hidden) openMap(); else $("pMapWrap").hidden = true; };
+  const range = () => { const a = dtParse($("pStart").value), b = dtParse($("pEnd").value); if (a == null || b == null) return; if (b <= a + H){ toast("The end has to be after the start"); renderPersSetup(); return; }
+    const lo = Math.floor(Date.now()/H)*H - 6*H, hi = Date.now() + 7.5*24*H; prefs.exp.start = Math.max(a, lo); prefs.exp.end = Math.min(b, hi); if (b > hi) toast("The forecast goes out about 7½ days; the end was moved in"); expChanged(false); };
+  $("pStart").onchange = range; $("pEnd").onchange = range;
+  $("pQuick").onclick = ev => { const b = ev.target.closest("[data-h]"); if (!b) return; const st = Math.ceil(Date.now()/H)*H; prefs.exp.start = st; prefs.exp.end = st + (+b.dataset.h)*H; expChanged(false); renderPersSetup(); };
+  $("pStep").onclick = ev => { const b = ev.target.closest("[data-step]"); if (!b) return; prefs.exp.hourly = b.dataset.step === "all" ? "all" : "0"; expChanged(false); renderPersSetup(); };
+  $("pMarine").onchange = ev => { prefs.exp.marine = ev.target.checked; prefs.exp.summary = null; prefs.exp.concerns = null; expChanged(true); };
+  $("pConc").oninput = ev => { prefs.exp.concerns = ev.target.value.split("\n").map(x => x.trim()).filter(Boolean); savePrefs(); renderPersSummary(); };
+  $("pDisc").oninput = ev => { prefs.exp.summary = ev.target.value; savePrefs(); renderPersSummary(); };
+  $("pSumReset").onclick = () => { prefs.exp.summary = null; prefs.exp.concerns = null; savePrefs(); renderPersSummary(); };
+  renderPersSetup();
+}
+function bindExp(){
+  if (!EXPO) return;
+  if (PERSONAL){ document.querySelectorAll(".plan-only").forEach(x => x.hidden = true); bindPersonal(); return; }
+  $("expSetup").hidden = false;
+  document.querySelectorAll(".plan-only").forEach(x => x.hidden = true);
+  $("pageTitle").textContent = BURN ? "Burn forecast" : "Exposure forecast";
+  document.title = BURN ? "Burn Forecast | KSC and CCSFS" : "Exposure Forecast | KSC and CCSFS";
+  $("expOp").oninput = e => { prefs.exp.op = e.target.value; savePrefs(); renderSites(); };
+  const range = () => {
+    let a = dtParse($("expStart").value), b = dtParse($("expEnd").value);
+    if (a == null || b == null) return;
+    const lo = Math.floor(Date.now()/H)*H - 6*H, hi = S.TL ? S.TL.t0 + (S.TL.n - 2)*H : Date.now() + 7.5*24*H;
+    let note = "";
+    if (a < lo){ a = lo; note = "Start moved to the earliest time with guidance. "; }
+    if (b > hi){ b = hi; note += "End moved to the last time with guidance (about 8 days out)."; }
+    if (b <= a + H){ toast("The end has to be after the start"); renderExpSetup(); return; }
+    prefs.exp.start = a; prefs.exp.end = b; if (note) toast(note.trim());
+    expChanged(false);
+  };
+  $("expStart").onchange = range; $("expEnd").onchange = range;
+  $("expHourly").onchange = e => { prefs.exp.hourly = e.target.value === "all" ? "all" : +e.target.value; expChanged(false); };
+  $("expQuick").onclick = ev => { const b = ev.target.closest("[data-q]"); if (!b) return; const st = Math.ceil(Date.now()/H)*H; prefs.exp.start = st; prefs.exp.end = st + (+b.dataset.q)*H; expChanged(false); };
+  $("cuLoad").onclick = () => {
+    const la = parseFloat($("cuLat").value), lo = parseFloat($("cuLon").value);
+    if (!(la > 27 && la < 30) || !(lo > -82 && lo < -79)){ toast("Enter a latitude and longitude near the Space Coast (decimal degrees, west is negative)"); return; }
+    prefs.exp.custom = { name: $("cuName").value.trim() || "Custom point", lat: la, lon: lo }; expChanged(true);
+  };
+  $("expCons").onchange = ev => {
+    const row = ev.target.closest("[data-id]"), f = ev.target.dataset.f; if (!row || !f) return;
+    const c = prefs.exp.constraints.find(x => x.id === row.dataset.id); if (!c) return;
+    c[f] = ev.target.type === "number" ? +ev.target.value : ev.target.value;
+    if (BURN && f === "f"){ const d = { rh:[">=",30], t:["<=",90], s20:["<=",15], g20:["<=",20], dir:[null,0], tw:[">=",9], mixh:[">=",1700], di:[">=",21], lvori:["<=",4], haines:["<=",4] }[c.f]; if (d){ c.op = d[0] || c.op; c.v = d[1]; if (c.f === "dir"){ c.v = 0; c.v2 = 90; } if (RXF[c.f].wind) c.unit = c.unit || "mph"; } renderExpSetup(); }
+    expChanged(false);
+  };
+  $("expCons").onclick = ev => { const d = ev.target.closest("[data-del]"); if (!d) return; prefs.exp.constraints = prefs.exp.constraints.filter(x => x.id !== d.dataset.del); expChanged(false); };
+  const newId = () => "c" + Date.now().toString(36);
+  if (BURN){
+    $("expOpLab").textContent = "Burn unit"; $("expOp").placeholder = "e.g. KSC Unit 12, Happy Creek block";
+    $("expConsTitle").textContent = "Prescription"; $("addWind").hidden = true; $("addTemp").hidden = true; $("addRx").hidden = false;
+    $("addRx").onclick = () => { prefs.exp.constraints.push({ id:newId(), type:"rx", f:"rh", op:">=", v:30 }); expChanged(false); };
+  }
+  $("addWind").onclick = () => { prefs.exp.constraints.push({ id:newId(), type:"wind", h:60, kind:"peak", op:">=", v:25, unit:"kt" }); expChanged(false); };
+  $("addTemp").onclick = () => { prefs.exp.constraints.push({ id:newId(), type:"temp", op:">", v:95, unit:"F" }); expChanged(false); };
+  bindTpls();
+  renderSchedExpo();
+  $("schUse").onclick = () => useSchedExpo($("schSel").value);
+  $("schSel").onchange = () => { const x = loadSched().find(y => y.id === $("schSel").value), n = $("schInfo"); if (!n) return; n.textContent = x ? [x.opnum && `Op ${x.opnum}`, x.jon && `JON ${x.jon}`, `${new Date(x.a).toISOString().slice(5, 16).replace("T", " ")}Z – ${new Date(x.b).toISOString().slice(5, 16).replace("T", " ")}Z`, x.location ? "" : "no pad given: choose the point after Use", x.notes].filter(Boolean).join(" · ") : ""; };
+  $("schFile").onchange = e => { const f = e.target.files[0]; e.target.value = ""; if (f) schedUpload(f, renderSchedExpo, "ground"); };
+  $("schTpl").onclick = () => download(new Blob([SCHED_TEMPLATE], { type:"text/csv" }), "Official_Schedule_template.csv");
+  $("schClear").onclick = () => { if (!confirm("Remove the official schedule stored on this computer?")) return; saveSched([]); renderSchedExpo(); };
+  $("foot1").textContent = "Rows are hourly for the period you choose, then 3-hour blocks to the end of the window. In blocks, temperature shows the warmest value for daytime blocks and the coolest for overnight blocks, winds show the block maximum, and probabilities are the chance of the event at any time in the block. Constraint probabilities are the chance that the constraint is met (for example, a peak wind at or above the limit) at any time in the row, from all the guidance members, and they move with your wind and temperature edits. 3 and 6 hr precipitation and lightning cells are merged across the hours they cover and linked to the 1 hr values. Press Enter to edit a table cell, Delete to return it to guidance.";
+  const f2 = $("foot1").nextElementSibling; if (f2) f2.textContent = "Winds at each constraint height are interpolated from each model's 10 m and 80 m winds (power law where 80 m is missing), and peaks scale the 10 m gust factor with height. The custom point uses the nearest MOS station within 30 km and the nearest high-res pipeline point within 15 km. Lightning comes only from guidance with explicit thunder probabilities.";
+  if (BURN){
+    $("foot1").textContent = "Rows are hourly for the period you choose, then 3-hour blocks. Prescription rows give the chance each criterion, and all of them together, is met through the hour, from all the guidance members; individual criteria move with your edits, \"All criteria\" follows the guidance. Press Enter to edit a cell, Delete to return it to guidance.";
+    if (f2) f2.textContent = "Mixing height is the models' boundary-layer height (ft above ground). Transport wind is the mean wind through the mixed layer from the pressure levels. Ventilation is mixing height × transport wind. LDSI is the Lavdas dispersion index (the TBW/MLB/MFL GFE tool): stability class from net radiation (sky cover, ceiling, sun) and the 20 ft wind, then the day or night equations with mixing height and transport wind. LVORI is the MFL table from RH and LDSI. Haines uses the low-elevation 950–850 hPa form. 20 ft winds are scaled from the 10 m winds; ceilings come from MOS or the model cloud layers.";
+  }
+  renderExpSetup();
+}
+function renderLocator(){
+  if (PERSONAL){ const el = document.getElementById("locator"); if (el) el.hidden = true; return; }
+  const X = lon => (lon + 80.78)/0.28*80, Y = lat => (28.80 - lat)/0.64*118;
+  const coast = [[28.85,-80.73],[28.76,-80.68],[28.70,-80.655],[28.64,-80.60],[28.59,-80.575],[28.53,-80.555],[28.48,-80.535],[28.455,-80.526],[28.435,-80.56],[28.40,-80.598],[28.32,-80.604],[28.24,-80.594],[28.10,-80.575]];
+  const pts = coast.map(([la, lo]) => `${X(lo).toFixed(1)},${Y(la).toFixed(1)}`).join(" ");
+  const tags = { "ksc-inland":"SLF", "ksc-pads":"39B", "cape-inland":"XMR", "cape-pad37":"37", patrick:"COF" };
+  const off = { "ksc-inland":[-5,3,"end"], "ksc-pads":[0,-7,"middle"], "cape-inland":[-6,3,"end"], "cape-pad37":[-6,3,"end"], patrick:[-6,3,"end"] };
+  SITES.forEach(s => { if (!tags[s.id]) tags[s.id] = s.tag || ""; if (!off[s.id]) off[s.id] = s.off || [-5,3,"end"]; });
+  $("locator").innerHTML = `<polygon class="water" points="${pts} 80,118 80,0"/><polyline class="coast" points="${pts}"/>` +
+    SITES.map(s => { const x = X(s.lon), y = Y(s.lat), o = off[s.id], on = s.id === prefs.site; return `<g data-site="${s.id}" style="cursor:pointer"><title>${s.name} (${s.point})</title><circle class="pt ${on ? "on" : ""}" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="${on ? 4.4 : 3.2}"/>${EXPO && !on ? "" : `<text x="${(x + o[0]).toFixed(1)}" y="${(y + o[1]).toFixed(1)}" text-anchor="${o[2]}" style="${on ? "fill:var(--accent)" : ""}">${tags[s.id]}</text>`}</g>`; }).join("");
+}
+const chartGroups = () => LMEF ? [
+  ["Probability of violation", ["rpov"].filter(k => P[k])],
+  ["LLCC rules", PARAMS.filter(p => /^r/.test(p.k) && p.k !== "rpov").map(p => p.k)],
+  ["Constraints", PARAMS.filter(p => p.k.startsWith("x")).map(p => p.k)],
+  ["Pad weather", ["sky","t","td","pp1","lt1"].filter(k => P[k])],
+  ["Wind", [...HEIGHTS.map(ft => "w" + ft).filter(v => VIEWS[v]), ...(P.dir ? ["dir"] : [])]],
+].filter(g => g[1].length) : [
+  ["Sky and temperature", ["sky","t","td","wbgt"].filter(k => P[k])],
+  ["Precipitation and lightning", ["pp","lt"].flatMap(k => !P[k + "1"] ? [] : P[k + "3"] ? [k] : [k + "1"])],
+  ["Wind", [...HEIGHTS.map(ft => "w" + ft).filter(v => VIEWS[v]), ...(P.dir ? ["dir"] : [])]],
+  [EXPO ? "Constraint probability" : LMEF ? "Constraints" : "Exceedance probability", PARAMS.filter(p => p.k.startsWith("x")).map(p => p.k)],
+  ...(LMEF ? [["Probability of violation", PARAMS.filter(p => p.k === "rpov").map(p => p.k)], ["LLCC rules", PARAMS.filter(p => /^r/.test(p.k) && p.k !== "rpov").map(p => p.k)]] : []),
+].filter(g => g[1].length);
+const chipName = k => ({ sky:"Sky", t:"Temp", td:"Dew pt", wbgt:"WBGT", pp:"Precipitation", lt:"Lightning", dir:"Direction", xhot:`>${hotOf(site())}°F` }[k] || (VIEWS[k] ? VIEWS[k].chip : P[k] ? (P[k].chip || P[k].l) : k));
+function renderParams(){
+  const e = edits[prefs.site] || {};
+  $("params").innerHTML = chartGroups().map(([gl, ks]) => `<div class="pgroup"><span class="gl">${gl}</span><div class="chips">${ks.map(k => `<button type="button" class="chip ${keysOf(k).some(q => e[q] && Object.keys(e[q]).length) ? "edited" : ""}" data-p="${k}" aria-pressed="${k === prefs.param}">${chipName(k)}</button>`).join("")}</div></div>`).join("");
+}
+/* the automatic factor for the parameter on the graph, day 1, at the selected point */
+function autoKey(){ const ks = keysOf(prefs.param); const k = ks[0] || "t"; return /^pp/.test(k) ? "pop" : /^lt/.test(k) ? "tst" : P[k] && P[k].ex ? P[k].ex : k; }
+function autoLabel(){ const g = AUTO_GROUP(autoKey()); return { t:"temperature and dew point", s:"sustained wind", g:"peak wind", d:"wind direction", pp:"precipitation", lt:"lightning" }[g] || "this parameter"; }
+function autoNow(sid){ const G = S.G[prefs.site]; if (!G || !AUTO_W || prefs.autoW === false) return null; return autoFactor(G, prefs, sid, autoKey(), Date.now() + 12*H); }
+function renderSources(){
+  const fams = Object.keys(FAMILIES);
+  let ok = 0, tot = 0;
+  $("srcgrid").innerHTML = fams.map(f => {
+    const list = ALL_SOURCES.filter(s => s.fam === f);
+    return `<div class="srcfam"><h3><i style="background:${FAMILIES[f].color}"></i>${FAMILIES[f].label}</h3>` + list.map(s => {
+      const st = S.status[s.id] || {}; tot++; if (st.ok) ok++;
+      const on = prefs.enabled[s.id] !== false, w = prefs.weight[s.id] ?? s.w ?? 1;
+      const txt = st.loading ? "loading" : st.ok ? st.note : (st.err || "not available");
+      const af = autoNow(s.id);
+      return `<div class="srow ${st.ok ? "" : "na"}"><input type="checkbox" data-src="${s.id}" ${on ? "checked" : ""} aria-label="Use ${s.name}"><span>${s.name} <span class="st">${txt}</span>${NBM_FAMILY.has(s.id) ? ' <span class="st" title="The gridded NBM and the NBM text products split one weight, so the NBM counts once (thunder, ceiling and visibility from the text keep full weight)">· shares the NBM weight</span>' : ""}${af != null && Math.abs(af - 1) >= 0.05 ? ` <span class="auto ${af > 1 ? "up" : "dn"}" title="Automatic weight from verification for ${autoLabel()} at this point, day 1">auto ×${af.toFixed(2)}</span>` : ""}</span><select data-w="${s.id}" aria-label="${s.name} weight">${[0.5,1,2,3].map(x => `<option value="${x}" ${x == w ? "selected" : ""}>×${x}</option>`).join("")}</select></div>`;
+    }).join("") + `</div>`;
+  }).join("");
+  const used = ALL_SOURCES.filter(s => (S.status[s.id] || {}).ok && prefs.enabled[s.id] !== false).length;
+  $("srcSum").textContent = S.loading && !ok ? "loading" : `${used} in the blend, ${ok} of ${tot} available${AUTO_W && prefs.autoW !== false ? ", auto-weighted" : ""}`;
+  const aw = $("autoW"), an = $("autoNote");
+  if (aw){ aw.checked = prefs.autoW !== false; aw.disabled = !AUTO_W; }
+  if (an) an.textContent = AUTO_W ? `Weights from verification, updated ${new Date(AUTO_W.updated).toISOString().slice(0, 16).replace("T", " ")}Z (last ${AUTO_W.window_days} days, ${autoLabel()} shown)` : "No verification weights yet; the verification workflow builds them as history accumulates.";
+}
+function renderStatus(){
+  const live = $("live");
+  const ok = Object.values(S.status).filter(s => s.ok).length;
+  const pend = Object.values(S.status).filter(s => s.loading).length;
+  live.classList.toggle("err", !S.loading && ok === 0);
+  live.textContent = DEMO ? "Demo guidance (synthetic data)" : pend ? `Loading guidance, ${ok} sources in` : ok ? `Guidance from ${ok} sources, fetched ${hhmm(S.fetchedAt, zulu())}${zulu() ? "Z" : " " + tzAbbr(S.fetchedAt)}` : "No guidance loaded";
+  const pb = published[prefs.site];
+  $("lastPub").textContent = pb ? `${hhmm(pb.t, zulu())}${zulu() ? "Z" : ""} ${new Date(pb.t).toDateString().slice(4,10)} by ${pb.by}` : "not yet";
+  $("editCount").textContent = editCount(prefs.site);
+  $("undo").disabled = !S.undo.length; $("redo").disabled = !S.redo.length;
+  $("orD").setAttribute("aria-pressed", !across()); $("orA").setAttribute("aria-pressed", across());
+  $("tzL").setAttribute("aria-pressed", !zulu()); $("tzZ").setAttribute("aria-pressed", zulu());
+  const b = $("banner");
+  if (DEMO){ b.className = "banner show demo"; b.textContent = "Demo mode: every value on this page is synthetic. Remove ?demo=1 from the address to load real guidance."; }
+  else if (!S.loading && ok === 0){ b.className = "banner show"; b.textContent = "Couldn't reach any guidance source from this browser. Check the network connection, then press Refresh guidance. You can still type a forecast into the table."; }
+  else if (!S.loading && ![...OM_DET, ...OM_ENS].some(d => (S.status[d.id] || {}).ok)){ b.className = "banner show"; b.textContent = "Model guidance from Open-Meteo didn't load, so only MOS and LAMP are showing. Press Refresh guidance to try again."; }
+  else if (!S.loading && !["lav","mav","nbs","met","mex","nbe","hrefct","refsct"].some(id => (S.status[id] || {}).ok)){ b.className = "banner show"; b.textContent = "No thunder guidance loaded (calibrated thunder, LAMP or MOS), so lightning probabilities are blank. Fill them in by hand, or check that the MOS mirror and high-res workflows are running."; }
+  else b.className = "banner";
+}
+
+/* ============================================================
+   Matrix
+   ============================================================ */
+let OF = null, QC = null;
+/* how many rows each 3 h / 6 h probability cell covers; {cov:true} = inside an earlier cell */
+function spanMap(k){
+  S.spanCache = S.spanCache || {};
+  if (S.spanCache[k]) return S.spanCache[k];
+  const p = P[k], rows = S.rows, res = rows.map(() => ({ s:1 }));
+  if (p.win && p.win > 1){
+    let start = -1, until = -Infinity, naStart = -1;
+    rows.forEach((r, i) => {
+      if (start >= 0 && r.a < until){ res[i] = { cov:true }; res[start].s++; naStart = -1; return; }
+      start = -1;
+      const c = probCell(r, p.win);
+      if (c && c.mode === "win"){ start = i; until = c.B; naStart = -1; return; }
+      if (!c){ if (naStart >= 0){ res[i] = { cov:true }; res[naStart].s++; } else { naStart = i; res[i] = { s:1, na:true }; } return; }
+      naStart = -1;
+    });
+  }
+  return (S.spanCache[k] = res);
+}
+const ownerIdx = (k, i) => { const m = spanMap(k); while (i > 0 && m[i] && m[i].cov) i--; return i; };
+function cellTitle(p, r, i){
+  if (!p.win) return p.title;
+  const c = probCell(r, p.win);
+  if (c && c.mode === "max") return `Highest ${p.win}-hour chance inside this ${r.len}-hour block`;
+  const sp = spanMap(p.k)[i]; if (!sp || sp.na) return p.title;
+  const end = S.rows[i + sp.s - 1].b, z = zulu();
+  return `${p.win}-hour chance, ${hhmm(r.a, z)} to ${hhmm(end, z)}${z ? "Z" : " " + tzAbbr(r.a)}`;
+}
+function recompute(){ OF = officialFor(prefs.site); QC = qcIssues(prefs.site, OF); }
+function renderTable(){
+  const s = site(), rows = S.rows, { o } = OF, e = edits[s.id] || {}, z = zulu();
+  const groups = []; PARAMS.forEach(p => { const g = groups[groups.length - 1]; if (g && g.g === p.g) g.n++; else groups.push({ g:p.g, n:1 }); });
+  let h = `<table class="mx"><thead><tr class="g"><th class="stick" rowspan="1"></th><th class="stick2"></th>${groups.map(g => `<th colspan="${g.n}" class="gstart">${grpLabel(g.g)}</th>`).join("")}</tr>`;
+  h += `<tr class="c"><th class="stick">Day</th><th class="stick2">Time<small>${tzLabel()}</small></th>`;
+  let lastG = null;
+  for (const p of PARAMS){ const gs = p.g !== lastG; lastG = p.g; h += `<th data-p="${p.k}" class="${gs ? "gstart" : ""} ${keysOf(prefs.param).includes(p.k) ? "sel" : ""}" title="${p.title}">${colLabel(p, s)}${p.s ? `<small>${p.s}</small>` : ""}</th>`; }
+  h += `</tr></thead><tbody>`;
+  let lastDay = null, lastBlk = null;
+  const dayRuns = {}; rows.forEach(r => { const dk = dayKey(r.a, z); dayRuns[dk] = (dayRuns[dk] || 0) + 1; });
+  rows.forEach((r, i) => {
+    const dk = dayKey(r.a, z), ds = dk !== lastDay, bs = r.len !== lastBlk && !ds; lastDay = dk; lastBlk = r.len;
+    let cls = (ds ? "dstart " : "") + (bs ? "sect " : "") + (S.hoverRow === i ? "hov" : "");
+    h += `<tr data-r="${i}" class="${cls}">`;
+    if (ds){ const L = dayLabel(r.a, z); const today = i === 0 ? "Today" : (dayKey(r.a, z) === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<td class="stick day" rowspan="${dayRuns[dk]}"><b>${today}</b>${today === L.wd ? "" : L.wd + "<br>"}${L.dt}</td>`; }
+    h += `<td class="stick2 tm">${rowTime(r)}${r.len > 1 ? `<small>${r.len} h</small>` : ""}</td>`;
+    lastG = null;
+    for (const p of PARAMS){
+      const gs = p.g !== lastG; lastG = p.g;
+      const sp = spanMap(p.k)[i]; if (sp.cov) continue;
+      const v = o[p.k][i], na = v === undefined, edd = e[p.k] && e[p.k][r.key] !== undefined;
+      const bad = QC.bad[p.k] && QC.bad[p.k][i];
+      const cur = S.cur && S.cur.i === i && S.cur.k === p.k;
+      const c = `c ${p.kind === "sev" ? "sev" : ""} ${gs ? "gstart" : ""} ${na ? "na" : ""} ${edd ? "ed" : ""} ${edd && linkedFlag(s.id, p.k, S.rows[i].key) ? "lk" : ""} ${bad ? "bad" : ""} ${cur ? "cur" : ""}`;
+      h += `<td class="${c}" data-k="${p.k}" data-i="${i}"${sp.s > 1 ? ` rowspan="${sp.s}"` : ""} style="${na ? "" : tint(p, v)}" title="${bad || cellTitle(p, r, i)}">${na ? "–" : fmt(p, v)}</td>`;
+    }
+    h += `</tr>`;
+  });
+  h += `</tbody></table>`;
+  const m = $("matrix"), st = m.scrollTop, sl = m.scrollLeft;
+  m.innerHTML = h; m.scrollTop = st; m.scrollLeft = sl;
+}
+function renderTableAcross(){
+  const s = site(), rows = S.rows, { o } = OF, e = edits[s.id] || {}, z = zulu();
+  const days = []; rows.forEach((r, i) => { const dk = dayKey(r.a, z); const d = days[days.length - 1]; if (d && d.dk === dk) d.n++; else days.push({ dk, n:1, i }); });
+  const dstart = new Set(days.map(d => d.i));
+  const tlab = r => { const a = hhmm(r.a, z).slice(0, 2); return r.len === 1 ? a : `${a}–${hhmm(r.b, z).slice(0, 2)}`; };
+  let h = `<table class="mx across"><thead><tr class="g"><th class="stick" colspan="2">${tzLabel()}</th>`;
+  days.forEach((d, j) => { const L = dayLabel(rows[d.i].a, z); const nm = j === 0 ? "Today" : (d.dk === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<th colspan="${d.n}" class="dcol">${d.n >= 3 ? `${nm}, ${L.dt}` : L.dt}</th>`; });
+  h += `</tr><tr class="c"><th class="stick">Parameter</th><th class="stick2"></th>`;
+  rows.forEach((r, i) => { h += `<th data-i="${i}" class="tcol ${dstart.has(i) ? "dcol" : ""} ${S.hoverRow === i ? "hov" : ""}">${tlab(r)}${r.len > 1 ? `<small>${r.len} h</small>` : ""}</th>`; });
+  h += `</tr></thead><tbody>`;
+  const gcount = {}; PARAMS.forEach(p => gcount[p.g] = (gcount[p.g] || 0) + 1);
+  let lastG = null;
+  for (const p of PARAMS){
+    const gs = p.g !== lastG; lastG = p.g;
+    h += `<tr class="${gs ? "gfirst" : ""}">`;
+    if (gs) h += `<th class="stick grp" rowspan="${gcount[p.g]}">${grpLabel(p.g)}</th>`;
+    h += `<th class="stick2 plab ${keysOf(prefs.param).includes(p.k) ? "sel" : ""}" data-p="${p.k}" title="${p.title}">${colLabel(p, s)}${p.s ? ` <small>${p.s}</small>` : ""}</th>`;
+    const spm = spanMap(p.k);
+    rows.forEach((r, i) => {
+      const sp = spm[i]; if (sp.cov) return;
+      const v = o[p.k][i], na = v === undefined, edd = e[p.k] && e[p.k][r.key] !== undefined;
+      const bad = QC.bad[p.k] && QC.bad[p.k][i], cur = S.cur && S.cur.i === i && S.cur.k === p.k;
+      const c = `c ${dstart.has(i) ? "dcol" : ""} ${na ? "na" : ""} ${edd ? "ed" : ""} ${edd && linkedFlag(s.id, p.k, S.rows[i].key) ? "lk" : ""} ${bad ? "bad" : ""} ${cur ? "cur" : ""} ${S.hoverRow === i ? "hov" : ""}`;
+      h += `<td class="${c}${sp.s > 1 ? " span" : ""}" data-k="${p.k}" data-i="${i}"${sp.s > 1 ? ` colspan="${sp.s}"` : ""} style="${na ? "" : tint(p, v)}" title="${bad || cellTitle(p, r, i)}">${na ? "–" : p.kind === "sev" && v !== "-" ? v : fmt(p, v)}</td>`;
+    });
+    h += `</tr>`;
+  }
+  h += `</tbody></table>`;
+  const m = $("matrix"), st = m.scrollTop, sl = m.scrollLeft;
+  m.innerHTML = h; m.scrollTop = st; m.scrollLeft = sl;
+}
+const across = () => prefs.orient === "across";
+function renderMatrix(){ across() ? renderTableAcross() : renderTable(); }
+/* hover highlight for the hovered time, in either orientation */
+function markHover(i){
+  const mx = $("matrix");
+  mx.querySelectorAll(".hov").forEach(x => x.classList.remove("hov"));
+  if (i == null) return;
+  if (across()) mx.querySelectorAll(`[data-i="${i}"]`).forEach(x => x.classList.add("hov"));
+  else { const tr = mx.querySelector(`tr[data-r="${i}"]`); if (tr) tr.classList.add("hov"); }
+}
+/* arrow / Enter / Tab move on screen: convert to (time step, parameter step) */
+const visStep = (down, right) => across() ? [right, down] : [down, right];
+function renderAll(){ recompute(); renderSites(); renderParams(); renderStatus(); renderMatrix(); renderChart(); renderLinkBar(); if (PERSONAL) renderPersSummary(); if (HOOKS.rendered) HOOKS.rendered(); }
+
+/* ---------- recent verification: the last 24 h of observations against the guidance ----------
+   Observations are the hourly tower / METAR / MRMS / MERLIN record from the verification workflow
+   (data/verif/obs). Model values for past hours come from Open-Meteo's recent runs (past_days). */
+const VERIF_PTS = { "ksc-inland":[28.6150,-80.6945], "ksc-pads":[28.6272,-80.6208], "cape-inland":[28.4686,-80.5667], "cape-pad37":[28.5314,-80.5650], "patrick":[28.2349,-80.6101] };
+const RECENT = { obs:{}, loading:{}, sel:null, part:0 };
+function obsPointFor(s){
+  if (VERIF_PTS[s.id]) return [s.id, 0];
+  let best = null, bd = 9; for (const [id, ll] of Object.entries(VERIF_PTS)){ const d = kmBetween(s.lat, s.lon, ll[0], ll[1]); if (d < bd){ bd = d; best = id; } }
+  return best ? [best, bd] : [null, null];
+}
+async function recentObsDay(key){
+  if (RECENT.obs[key] !== undefined || RECENT.loading[key]) return;
+  RECENT.loading[key] = true;
+  try { RECENT.obs[key] = DEMO ? demoObsDay(key) : await getJSON(`${DATA_BASE}data/verif/obs/${key}.json?ts=${Date.now()}`, 8000); } catch (e) { RECENT.obs[key] = null; }
+  RECENT.loading[key] = false; renderRecent();
+}
+const dayKeyZ = t => new Date(t).toISOString().slice(0, 10).replace(/-/g, "");
+function obsAt(pid, key, t){ const od = RECENT.obs[dayKeyZ(t)]; if (!od) return undefined; const p = (od.points || {})[pid]; if (!p) return null; const f = key === "dir" ? "d54" : key; const a = p[f]; return a ? a[new Date(t).getUTCHours()] : null; }
+/* any tower near a point, at any height: exact, interpolated in log height between two sensors on the
+   same tower, or the nearest sensor within 35 % of the height. field: s (hour mean), g (peak), t */
+function towerChoice(lat, lon, ft, field, od){
+  const tw = od && od.towers; if (!tw) return null;
+  const near = Object.entries(tw).map(([id, r]) => ({ id, r, d: kmBetween(lat, lon, r.lat, r.lon) })).filter(x => x.d <= 4).sort((a, b) => a.d - b.d);
+  for (const { id, r, d } of near){
+    const hs = Object.keys(r.h).map(Number).sort((a, b) => a - b); if (!hs.length) continue;
+    if (field === "t"){ const lo = hs.find(h => r.h[h].t && r.h[h].t.some(v => v != null)); if (lo != null) return { id, d, how:"temp", h:[lo] }; continue; }
+    if (hs.includes(ft)) return { id, d, how:"exact", h:[ft] };
+    const below = hs.filter(h => h < ft).pop(), above = hs.find(h => h > ft);
+    if (below != null && above != null) return { id, d, how:"interp", h:[below, above] };
+    const nearest = hs.reduce((a, b) => Math.abs(b - ft) < Math.abs(a - ft) ? b : a);
+    if (Math.abs(nearest - ft)/ft <= 0.35) return { id, d, how:"nearest", h:[nearest] };
+  }
+  return null;
+}
+function towerValue(od, ch, ft, field, hour){
+  if (!ch) return null; const r = od.towers[ch.id]; const f = field === "t" ? "t" : field;
+  const v = h => (r.h[h] && r.h[h][f]) ? r.h[h][f][hour] : null;
+  if (ch.h.length === 1) return v(ch.h[0]);
+  const a = v(ch.h[0]), b = v(ch.h[1]); if (a == null || b == null) return null;
+  return a + (b - a)*Math.log(ft/ch.h[0])/Math.log(ch.h[1]/ch.h[0]);
+}
+const towerLabel = (ch, ft) => !ch ? "" : ch.how === "temp" ? `tower ${ch.id}, ${ch.d.toFixed(1)} km` : `tower ${ch.id}${ch.how === "interp" ? `, ${ch.h[0]}–${ch.h[1]} ft interpolated to ${ft} ft` : ch.how === "nearest" ? `, ${ch.h[0]} ft sensor` : `, ${ft} ft`}, ${ch.d.toFixed(1)} km`;
+/* demo: observations near the guidance, so the panel can be tried without the workflow */
+function demoObsDay(key){
+  const G = S.G[prefs.site]; if (!G) return null;
+  const t0 = Date.UTC(+key.slice(0, 4), +key.slice(4, 6) - 1, +key.slice(6, 8)), pts = {};
+  for (const pid of Object.keys(VERIF_PTS)){
+    const Gp = S.G[pid] || G, p = {}; ["t","td","s54","g54","s200","g200","d54","pr","cg10"].forEach(f => p[f] = new Array(24).fill(null));
+    for (let h = 0; h < 24; h++){
+      const t = t0 + h*H; if (t > Date.now() - H) continue;
+      const i = S.TL.idx(t); if (i < 0) continue;
+      const mean = k => { const v = Gp.src.flatMap(s2 => s2.members.map(m => m[k] && m[k][i])).filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0)/v.length : null; };
+      const jit = (v, sd) => v == null ? null : Math.round((v + (Math.sin(t/3.7e6 + sd)*sd)) * 10)/10;
+      p.t[h] = jit(mean("t"), 1.5); p.td[h] = jit(mean("td"), 1); p.s54[h] = jit(mean("s54"), 2); p.g54[h] = jit(mean("g54"), 3); p.s200[h] = jit(mean("s200"), 2); p.g200[h] = jit(mean("g200"), 3); p.d54[h] = mean("d10"); p.pr[h] = 0; p.cg10[h] = 0;
+    }
+    pts[pid] = p;
+  }
+  /* a demo tower at each point on the page, at its wind heights */
+  const towers = {};
+  for (const st of SITES){
+    const Gs = S.G[st.id]; if (!Gs) continue;
+    const rec = { lat: st.lat + 0.004, lon: st.lon, h:{} };
+    for (const ft of HEIGHTS){
+      const hh = rec.h[ft] = { s:new Array(24).fill(null), sx:new Array(24).fill(null), g:new Array(24).fill(null), t:new Array(24).fill(null) };
+      for (let h = 0; h < 24; h++){
+        const t = t0 + h*H; if (t > Date.now() - H) continue; const i = S.TL.idx(t); if (i < 0) continue;
+        const mean = k => { const v = Gs.src.flatMap(s2 => s2.members.map(m => m[k] && m[k][i])).filter(x => x != null); return v.length ? v.reduce((a, b) => a + b, 0)/v.length : null; };
+        const sv = mean("s" + ft), gv = mean("g" + ft), tv = mean("t"), j = Math.sin(t/2.9e6 + ft);
+        hh.s[h] = sv == null ? null : Math.round((sv + 2*j)*10)/10; hh.sx[h] = sv == null ? null : Math.round((sv*1.2 + 2*j)*10)/10;
+        hh.g[h] = gv == null ? null : Math.round((gv + 3*j)*10)/10; hh.t[h] = tv == null ? null : Math.round((tv + j)*10)/10;
+      }
+    }
+    towers[st.tag || st.id] = rec;
+  }
+  return { points: pts, towers };
+}
+function pastMean(src, key, i){
+  const v = src.members.map(m => m[key] ? m[key][i] : null).filter(x => x != null); if (!v.length) return null;
+  if (key === "d10"){ let u = 0, w = 0; v.forEach(d => { u += Math.sin(d*Math.PI/180); w += Math.cos(d*Math.PI/180); }); return (Math.atan2(u, w)*180/Math.PI + 360) % 360; }
+  return v.reduce((a, b) => a + b, 0)/v.length;
+}
+function renderRecent(){
+  const box = $("recentBody"); if (!box) return;
+  const s = site(), G = S.G[s.id]; if (!G || !S.TL){ box.innerHTML = `<p class="mut">Waiting for guidance.</p>`; return; }
+  const keysAll = keysOf(prefs.param);
+  const cons = P[keysAll[0]] && P[keysAll[0]].cons ? P[keysAll[0]] : null;
+  let keys = cons ? [cons.ex === "tmax" || cons.ex === "tmin" ? "t" : cons.ex] : keysAll.filter(k => /^(t|td|dir)$/.test(k) || /^[sg]\d+$/.test(k));
+  const [pid0, dist0] = obsPointFor(s);
+  const pid = pid0, dist = dist0;
+  const now = Math.floor(Date.now()/H)*H, hours = []; for (let t = now - 24*H; t < now; t += H) hours.push(t);
+  if (DEMO) [...new Set(hours.map(dayKeyZ))].forEach(k => { RECENT.obs[k] = demoObsDay(k); });
+  else [...new Set(hours.map(dayKeyZ))].forEach(recentObsDay);
+  if (!keys.length){
+    box.innerHTML = `<p class="mut">Pick temperature, dew point, a wind height, direction or a constraint on the graph to compare with observations.</p>`; $("recentSum").textContent = ""; return;
+  }
+  if (RECENT.part >= keys.length) RECENT.part = 0;
+  const key = keys[RECENT.part], mkey = key === "dir" ? "d10" : key, p = P[key] || { l:key, unit:"" };
+  /* observations: the forecast point's own record for its standard fields, otherwise the nearest tower at this height */
+  const hm = key.match(/^([sg])(\d+)$/), ft = hm ? +hm[2] : null;
+  const ownPoint = pid && !dist && (!hm || ft === 54 || ft === 200);
+  let obsLabel = "", ch = null;
+  const obs = hours.map(t => {
+    const od = RECENT.obs[dayKeyZ(t)]; if (od === undefined) return undefined; if (!od) return null;
+    if (ownPoint || (!hm && key !== "t") || (key === "t" && pid && dist < 3)) return obsAt(pid, key, t);
+    if (hm || key === "t"){ ch = ch || towerChoice(s.lat, s.lon, ft || 6, hm ? hm[1] : "t", od); return towerValue(od, ch, ft, hm ? hm[1] : "t", new Date(t).getUTCHours()); }
+    return pid ? obsAt(pid, key, t) : null;
+  });
+  obsLabel = ch ? towerLabel(ch, ft) : pid ? `${PNAMES[pid] || pid}${dist ? `, ${dist.toFixed(1)} km away` : ""}` : "";
+  if (obs.every(v => v === undefined)){ box.innerHTML = `<p class="mut">Loading observations…</p>`; return; }
+  if (obs.every(v => v == null)){ box.innerHTML = `<p class="mut">No observations for ${p.title || p.l} near ${s.name} in the last 24 hours${hm ? ` (no tower within 4 km has a sensor near ${ft} ft)` : ""}.</p>`; $("recentSum").textContent = "no observations"; return; }
+  const on = G.src.filter(x => prefs.enabled[x.def.id] !== false && x.members.length);
+  const series = on.map(x => ({ id:x.def.id, name:x.def.name, fam:x.def.fam, ys: hours.map(t => { const i = S.TL.idx(t); return i >= 0 && i < S.TL.n ? pastMean(x, mkey, i) : null; }) })).filter(x => x.ys.some(v => v != null));
+  const err = (a, b) => key === "dir" ? ((a - b + 540) % 360) - 180 : a - b;
+  const stat = ys => { let n = 0, ae = 0, e = 0; ys.forEach((v, i) => { const o = obs[i]; if (v == null || o == null || (key === "dir" && (obsAt(pid, "s54", hours[i]) || 0) < 5)) return; const d = err(v, o); n++; ae += Math.abs(d); e += d; }); return n ? { n, mae: ae/n, bias: e/n } : null; };
+  series.forEach(x => { x.st = stat(x.ys); x.af = autoFactor(G, prefs, x.id, key === "dir" ? "dir" : key, Date.now() + 3*H); });
+  const W0 = x => prefs.weight[x.id] ?? (ALL_SOURCES.find(d => d.id === x.id) || {}).w ?? 1;
+  const blend = hours.map((t, i) => { let a = 0, w = 0; series.forEach(x => { const v = x.ys[i]; if (v == null) return; const ww = W0(x)*(x.af || 1); a += v*ww; w += ww; }); return w ? a/w : null; });
+  const bst = stat(blend);
+  const ranked = series.filter(x => x.st).sort((a, b) => a.st.mae - b.st.mae);
+  const sel = RECENT.sel && series.find(x => x.id === RECENT.sel) ? RECENT.sel : null;
+  const top = ranked.slice(0, 3).map(x => x.id);
+  /* chart */
+  const Wd = 760, Hd = 230, L = 44, Rr = 12, T = 14, B = 26, sc = isWind(p) ? wfac() : 1;
+  const all = [...obs, ...blend, ...series.flatMap(x => x.ys), ...(cons && cons.v != null ? [cons.v] : [])].filter(v => v != null && isFinite(v)).map(v => v*sc);
+  let lo = Math.min(...all), hi = Math.max(...all); if (key === "dir"){ lo = 0; hi = 360; } else { const pad = Math.max(1, (hi - lo)*0.08); lo = Math.floor(lo - pad); hi = Math.ceil(hi + pad); }
+  const x = i => L + (i + 0.5)*(Wd - L - Rr)/hours.length, y = v => T + (1 - (v*sc - lo)/(hi - lo || 1))*(Hd - T - B);
+  const path = ys => { const pts = ys.map((v, i) => v == null ? null : `${x(i).toFixed(1)},${y(v).toFixed(1)}`); let d = "", pen = false; pts.forEach(q => { if (!q){ pen = false; return; } d += (pen ? "L" : "M") + q; pen = true; }); return d; };
+  const COL = ["#0E7C86","#B5862B","#5A6ACF"];
+  let g = `<svg viewBox="0 0 ${Wd} ${Hd}" class="rchart" role="img" aria-label="Last 24 hours of ${p.l} observed against the guidance">`;
+  for (let k = 0; k <= 4; k++){ const v = lo + (hi - lo)*k/4; const yy = T + (1 - k/4)*(Hd - T - B); g += `<line x1="${L}" x2="${Wd - Rr}" y1="${yy}" y2="${yy}" class="gr"/><text x="${L - 6}" y="${yy + 4}" class="ax" text-anchor="end">${Math.round(v)}</text>`; }
+  hours.forEach((t, i) => { if (i % 3 === 0) g += `<text x="${x(i)}" y="${Hd - 8}" class="ax" text-anchor="middle">${hhmm(t, zulu()).slice(0, 2)}${zulu() ? "Z" : ""}</text>`; });
+  series.forEach(xs => { if (!top.includes(xs.id) && xs.id !== sel) g += `<path d="${path(xs.ys)}" class="rsrc"/>`; });
+  top.forEach((id, k) => { const xs = series.find(q => q.id === id); if (xs && id !== sel) g += `<path d="${path(xs.ys)}" fill="none" stroke="${COL[k]}" stroke-width="1.8"/>`; });
+  if (sel){ const xs = series.find(q => q.id === sel); g += `<path d="${path(xs.ys)}" fill="none" stroke="#C0462F" stroke-width="2.6"/>`; }
+  g += `<path d="${path(blend)}" fill="none" stroke="var(--ink)" stroke-width="2.4" stroke-dasharray="6 4"/>`;
+  if (cons && cons.v != null && cons.v*sc >= lo && cons.v*sc <= hi) g += `<line x1="${L}" x2="${Wd - Rr}" y1="${y(cons.v)}" y2="${y(cons.v)}" stroke="#B23A2E" stroke-width="1.6" stroke-dasharray="3 3"/><text x="${Wd - Rr - 4}" y="${y(cons.v) - 5}" class="ax" text-anchor="end" fill="#B23A2E">limit ${Math.round(cons.v*sc)}</text>`;
+  obs.forEach((v, i) => { if (v != null) g += `<circle cx="${x(i)}" cy="${y(v)}" r="3.6" class="robs"><title>${hhmm(hours[i], zulu())} observed ${Math.round(v*sc)}${isWind(p) ? " " + wuLabel() : p.unit === "°F" ? "°F" : ""}</title></circle>`; });
+  g += `</svg>`;
+  const met = cons ? obs.filter(v => v != null && (cons.op === ">" ? v > cons.v : cons.op === ">=" ? v >= cons.v : cons.op === "<=" ? v <= cons.v : v < cons.v)).length : null;
+  const legend = `<div class="rleg"><span><i class="o"></i>Observed${obsLabel ? ` (${obsLabel})` : ""}</span><span><i style="border-top:2px dashed var(--ink)"></i>Blend</span>${top.map((id, k) => `<span><i style="background:${COL[k]}"></i>${series.find(q => q.id === id).name}</span>`).join("")}${sel ? `<span><i style="background:#C0462F"></i>${series.find(q => q.id === sel).name}</span>` : ""}<span><i style="background:var(--rule)"></i>Other sources</span></div>`;
+  const fmtE = v => (isWind(p) ? v*wfac() : v).toFixed(1);
+  const tbl = `<table class="rtab"><thead><tr><th>Source</th><th>MAE</th><th>Bias</th><th>Hours</th><th>Auto</th></tr></thead><tbody>
+    ${bst ? `<tr class="bl"><th>Blend</th><td>${fmtE(bst.mae)}</td><td>${bst.bias >= 0 ? "+" : ""}${fmtE(bst.bias)}</td><td>${bst.n}</td><td></td></tr>` : ""}
+    ${ranked.map(xs => `<tr data-rs="${xs.id}" class="${xs.id === sel ? "on" : ""}"><th>${xs.name}</th><td>${fmtE(xs.st.mae)}</td><td>${xs.st.bias >= 0 ? "+" : ""}${fmtE(xs.st.bias)}</td><td>${xs.st.n}</td><td>${Math.abs((xs.af || 1) - 1) >= 0.05 ? "×" + xs.af.toFixed(2) : ""}</td></tr>`).join("")}</tbody></table>`;
+  const unitTxt = key === "dir" ? "degrees" : isWind(p) ? wuLabel() : p.unit || "";
+  box.innerHTML = `${keys.length > 1 ? `<div class="seg rpart" role="group">${keys.map((k, i) => `<button type="button" data-rp="${i}" aria-pressed="${i === RECENT.part}">${(P[k] || {}).s || k}</button>`).join("")}</div>` : ""}
+    <div class="rgrid"><div>${g}${legend}</div><div class="rtw">${tbl}<p class="mut">Last 24 hours at ${s.name}, ${p.l}${p.s ? " " + p.s : ""}, ${unitTxt}. Model values for past hours come from their recent runs. Click a source to highlight it.</p></div></div>`;
+  $("recentSum").textContent = (ranked.length ? `best last 24 h: ${ranked[0].name} (${fmtE(ranked[0].st.mae)} ${unitTxt})${bst ? `, blend ${fmtE(bst.mae)}` : ""}` : "") + (cons ? ` · ${met} of ${obs.filter(v => v != null).length} observed hours met the constraint` : "");
+}
+const PNAMES = { "ksc-inland":"SLF towers", "ksc-pads":"LC-39B towers", "cape-inland":"KXMR towers", "cape-pad37":"SLC-37 towers", "patrick":"KCOF" };
+
+/* ---------- editing ---------- */
+function parseInput(p, txt){
+  txt = String(txt).trim(); if (txt === "") return null;
+  if (p.kind === "sky"){ const u = txt.toUpperCase(); const alias = { CLEAR:"CLR", SKC:"CLR", SCATTERED:"SCT", BROKEN:"BKN", OVERCAST:"OVC" }; const c = alias[u] || u; if (SKY_MID[c] !== undefined) return SKY_MID[c]; const n = parseFloat(txt); return isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : undefined; }
+  if (p.kind === "dir"){ const d = parseDir(txt); return d == null ? undefined : (Math.round(d/10)*10) % 360; }
+  if (p.kind === "sev"){ const u = txt.toUpperCase(); const map = { NONE:"-", "-":"-", MARGINAL:"MRGL", SLIGHT:"SLGT", ENHANCED:"ENH", MODERATE:"MDT" }; const c = map[u] || u; return SEV.includes(c) ? c : undefined; }
+  let n = parseFloat(txt.replace("%", "")); if (!isFinite(n)) return undefined;
+  if (isWind(p) && wfac() !== 1) return Math.max(0, Math.round(n/wfac()*10)/10);   /* typed in the display unit, stored in knots */
+  if (p.kind === "prob" && n > 0 && n < 1 && txt.includes(".")) n *= 100;
+  if (p.lo != null) n = Math.max(p.lo, n); if (p.hi != null) n = Math.min(p.hi, n);
+  return Math.round(n);
+}
+function setEdit(sid, k, key, val, group, isLinked){
+  const e = edits[sid] = edits[sid] || {}; const m = e[k] = e[k] || {};
+  const old = m[key], lo = linkedFlag(sid, k, key), ln = val === undefined || val === null ? false : !!isLinked;
+  if (val === undefined || val === null) delete m[key]; else m[key] = val;
+  if (old !== m[key] || lo !== ln){ setLinkedFlag(sid, k, key, ln); group.push({ sid, k, key, old, nw: m[key], lo, ln }); }
+}
+/* ---------- horizontal consistency: edits carry to the other forecast points ----------
+   The forecaster's adjustment (official minus guidance) is applied at each other point on top of
+   that point's own guidance, so the differences the guidance expects between points are kept:
+   degrees for temperatures, a percentage for winds, points for probabilities and cloud cover.
+   Distance sets the strength: full within 15 km, tapering to 40 % at 45 km or more. Cells edited
+   by hand at another point are never overwritten. Hold Alt (Option) while editing, or untick a point
+   in "Edits apply to", to change one point only (Alt arms the next edit). */
+const LINKED_KEY = LS.edits + ":linked";
+let LINKED = store.get(LINKED_KEY, {});
+const linkedFlag = (sid, k, key) => !!(((LINKED[sid] || {})[k] || {})[key]);
+function setLinkedFlag(sid, k, key, on){ const m = ((LINKED[sid] = LINKED[sid] || {})[k] = LINKED[sid][k] || {}); if (on) m[key] = 1; else delete m[key]; }
+/* Alt (Option), pressed or held while clicking, makes the NEXT edit apply to this point only */
+const MOD = { alt:false, once:false };
+const armOnce = on => { MOD.once = on; const h = document.querySelector("#linkBar .lhint"); if (h && prefs.linkPts !== false) h.textContent = on ? "Next edit: this point only (Esc to cancel)" : "Press Alt (Option) before an edit to change this point only"; const bar = document.getElementById("linkBar"); if (bar) bar.classList.toggle("once", on); };
+addEventListener("keydown", e => { if (e.key === "Alt" && !e.repeat && linkOn()) armOnce(!MOD.once); if (e.key === "Escape" && MOD.once) armOnce(false); }, true);
+document.addEventListener("pointerdown", e => { if (e.altKey && linkOn() && !MOD.once) armOnce(true); }, true);
+const linkOn = () => !EXPO && !LMEF && prefs.linkPts !== false && SITES.length > 1;
+function linkWeight(a, b){ const d = kmBetween(a.lat, a.lon, b.lat, b.lon); return Math.max(0.4, Math.min(1, 1 - (d - 15)/50)); }
+function linkTargets(){ const on = prefs.linkTo || {}; return SITES.filter(x => x.id !== prefs.site && on[x.id] !== false); }
+function adjust(k, p, vA, gA, gB, w){
+  if (vA == null || gA == null || gB == null || typeof vA !== "number") return undefined;
+  if (p.kind === "sev") return vA;
+  if (isWind(p) && p.kind !== "dir"){ const r = gA > 1 ? vA/gA : null; return r != null ? Math.max(0, Math.round(gB*(1 + w*(r - 1)))) : Math.max(0, Math.round(gB + w*(vA - gA))); }
+  if (p.kind === "dir") return Math.round(((gB + w*(((vA - gA + 540) % 360) - 180)) % 360 + 360) % 360/10)*10 % 360;
+  const v = gB + w*(vA - gA);
+  if (p.kind === "prob" || p.kind === "sky") return Math.max(0, Math.min(100, Math.round(v)));
+  return Math.round(v);
+}
+/* ---------- consistency between points ----------
+   Flags neighbouring points whose official difference strays from the difference the guidance
+   expects, where at least one of them was edited. */
+const CONS_TOL = { t:3, td:3, s54:[5, 0.3], s200:[5, 0.3], g54:[6, 0.3], g200:[6, 0.3], pp1:25, pp3:25, pp6:25, lt1:25, lt3:25, lt6:25 };
+const CONS_NAME = { t:"temperature", td:"dew point", s54:"54 ft sustained wind", s200:"200 ft sustained wind", g54:"54 ft peak wind", g200:"200 ft peak wind", pp1:"1 hr precip chance", pp3:"3 hr precip chance", pp6:"6 hr precip chance", lt1:"1 hr lightning chance", lt3:"3 hr lightning chance", lt6:"6 hr lightning chance" };
+function consistencyIssues(ids){
+  if (EXPO || LMEF) return [];
+  const sites = (ids || SITES.map(x => x.id)).map(id => SITES.find(x => x.id === id)).filter(Boolean);
+  const OFs = Object.fromEntries(sites.map(x => [x.id, officialFor(x.id)]));
+  const out = [];
+  for (let a = 0; a < sites.length; a++) for (let b = a + 1; b < sites.length; b++){
+    const A = sites[a], B = sites[b]; if (kmBetween(A.lat, A.lon, B.lat, B.lon) > 25) continue;
+    const eA = edits[A.id] || {}, eB = edits[B.id] || {};
+    for (const k of Object.keys(CONS_TOL)){
+      if (!P[k] || !OFs[A.id].o[k]) continue;
+      const tol = CONS_TOL[k]; let worst = null, n = 0;
+      S.rows.forEach((r, i) => {
+        if (!((eA[k] || {})[r.key] !== undefined || (eB[k] || {})[r.key] !== undefined)) return;
+        const oa = OFs[A.id].o[k][i], ob = OFs[B.id].o[k][i], ga = (OFs[A.id].g[k] || [])[i], gb = (OFs[B.id].g[k] || [])[i];
+        if ([oa, ob, ga, gb].some(v => v == null || typeof v !== "number")) return;
+        const off = oa - ob, gd = ga - gb, dev = Math.abs(off - gd);
+        const lim = Array.isArray(tol) ? Math.max(tol[0], tol[1]*Math.max(ga, gb)) : tol;
+        if (dev > lim){ n++; if (!worst || dev > worst.dev) worst = { i, off, gd, dev }; }
+      });
+      if (worst) out.push({ kind:"pair", a:A.id, b:B.id, k, n, ...worst });
+    }
+  }
+  return out.sort((p, q) => q.dev - p.dev);
+}
+function consText(it){
+  const nm = id => SITES.find(x => x.id === id).name, r = S.rows[it.i], when = `${dayLabel(r.a, zulu()).wd.slice(0, 3)} ${rowTime(r)}`;
+  if (it.kind === "ltpp") return `${nm(it.a)}, ${when}: ${it.w} hr lightning chance ${Math.round(it.lt)}% is above the precipitation chance ${Math.round(it.pp)}%${it.n > 1 ? ` (${it.n} periods)` : ""}`;
+  const p = P[it.k], u = isWind(p) ? " " + wuLabel() : p.kind === "prob" ? " points" : "°F", f = v => Math.abs(Math.round(isWind(p) ? v*wfac() : v));
+  const dir = it.off >= 0 ? "warmer/higher" : "cooler/lower";
+  return `${nm(it.a)} vs ${nm(it.b)}, ${CONS_NAME[it.k]}, ${when}: ${f(it.off)}${u} apart${it.off === 0 ? "" : it.off > 0 ? ` (${nm(it.a)} ${p.kind === "prob" ? "higher" : isWind(p) ? "stronger" : "warmer"})` : ` (${nm(it.b)} ${p.kind === "prob" ? "higher" : isWind(p) ? "stronger" : "warmer"})`}; the guidance has ${f(it.gd)}${u}${it.n > 1 ? ` (${it.n} periods)` : ""}`;
+}
+/* make point "to" carry the same adjustment as point "from" on one parameter, for the flagged periods' whole run */
+function alignPoints(from, to, k){
+  const A = SITES.find(x => x.id === from), B = SITES.find(x => x.id === to), oA = officialFor(from), oB = officialFor(to), g = [];
+  const w = linkWeight(A, B), p = P[k];
+  S.rows.forEach((r, i) => {
+    const eA = ((edits[from] || {})[k] || {})[r.key];
+    const vA = oA.o[k][i], gA = (oA.g[k] || [])[i], gB = (oB.g[k] || [])[i];
+    if (eA === undefined && ((edits[to] || {})[k] || {})[r.key] === undefined) return;
+    const nv = eA === undefined ? undefined : adjust(k, p, vA, gA, gB, w);
+    setEdit(to, k, r.key, nv, g, false);
+  });
+  const keep = MOD.alt; MOD.alt = true; commit(g); MOD.alt = keep;
+  toast(`${B.name} ${P[k] ? CONS_NAME[k] || P[k].l : k} now carries ${A.name}'s adjustment`);
+}
+/* carry every edit at one point to the others (hand edits elsewhere are kept), as one undo step */
+function carryAll(from){
+  const keep = prefs.site; prefs.site = from;
+  const fake = []; const e = edits[from] || {};
+  for (const k in e) for (const key in e[k]) if (!linkedFlag(from, k, key)) fake.push({ sid:from, k, key, old:e[k][key], nw:e[k][key], ln:false });
+  const save = MOD.once; MOD.once = false;
+  let real = [];
+  if (fake.length){ const grp = fake.slice(); propagate(grp); real = grp.slice(fake.length); }
+  MOD.once = save; prefs.site = keep;
+  if (!real.length){ toast("Nothing to carry: the other points already match or have their own edits"); return; }
+  S.undo.push(real); if (S.undo.length > 200) S.undo.shift(); S.redo = [];
+  saveEdits(); renderAll(); toast(S.linkNote || "Carried to the other points");
+}
+function renderLinkBar(){
+  const bar = $("linkBar"); if (!bar) return;
+  if (EXPO || LMEF || SITES.length < 2){ bar.hidden = true; return; }
+  bar.hidden = false;
+  const src = site(), on = prefs.linkTo || {}, linking = prefs.linkPts !== false;
+  const issues = S.consCache || [];
+  clearTimeout(S.consT); S.consT = setTimeout(() => { const n = consistencyIssues(); const changed = n.length !== (S.consCache || []).length; S.consCache = n; if (changed) renderLinkBar(); }, 350);
+  bar.innerHTML = `<label class="lsw"><input type="checkbox" id="linkSw" ${linking ? "checked" : ""}> <b>Edits also apply to</b></label>
+    ${SITES.filter(x => x.id !== src.id).map(x => `<label class="lch ${linking ? "" : "off"}"><input type="checkbox" data-lt="${x.id}" ${on[x.id] !== false ? "checked" : ""} ${linking ? "" : "disabled"}> ${x.name} <span>${Math.round(linkWeight(src, x)*100)}%</span></label>`).join("")}
+    <span class="lhint">${linking ? (MOD.once ? "Next edit: this point only (Esc to cancel)" : "Press Alt (Option) before an edit to change this point only") : "Edits change this point only"}</span>
+    <span class="sp"></span>
+    <button type="button" class="btn ${issues.length ? "warn" : ""}" id="consBtn">${issues.length ? `${issues.length} consistency flag${issues.length === 1 ? "" : "s"}` : "Points consistent"}</button>`;
+}
+function openConsistency(){
+  const dlg = $("conDlg"), list = consistencyIssues();
+  $("conList").innerHTML = list.length ? list.map((it, n) => `<li><span>${hesc(consText(it))}</span>${it.kind === "pair" ? `<span class="acts"><button type="button" class="btn" data-go="${n}">Show</button><button type="button" class="btn" data-al="${n}" data-from="${it.a}" data-to="${it.b}">Match ${hesc(SITES.find(x => x.id === it.a).name)}</button><button type="button" class="btn" data-al="${n}" data-from="${it.b}" data-to="${it.a}">Match ${hesc(SITES.find(x => x.id === it.b).name)}</button></span>` : `<span class="acts"><button type="button" class="btn" data-go="${n}">Show</button></span>`}</li>`).join("") : `<li class="ok">No inconsistencies: every edited period keeps the differences between points that the guidance expects (within ${CONS_TOL.t}°F, 5 kt or 30%, and 25 points for probabilities).</li>`;
+  dlg._list = list;
+  const cur = site(); $("conCarry").textContent = `Carry ${cur.name}'s edits to the other points`; $("conCarry").hidden = !editCount(cur.id);
+  if (!dlg.open) dlg.showModal();
+}
+function propagate(group){
+  if (!linkOn() || MOD.alt) return 0;
+  if (MOD.once){ armOnce(false); return 0; }
+  const src = SITES.find(x => x.id === prefs.site); if (!src) return 0;
+  const own = group.filter(c => c.sid === prefs.site && !c.ln); if (!own.length) return 0;
+  const targets = linkTargets(); if (!targets.length) return 0;
+  const gSrc = officialFor(src.id).g || {}, idx = new Map(S.rows.map((r, i) => [r.key, i]));
+  const touched = new Map();
+  for (const t of targets){
+    const OFt = officialFor(t.id), gT = OFt.g || {}, w = linkWeight(src, t);
+    for (const c of own){
+      const p = P[c.k]; if (!p || p.kind === "text") continue;
+      const i = idx.get(c.key); if (i == null) continue;
+      const cur = ((edits[t.id] || {})[c.k] || {})[c.key];
+      if (cur !== undefined && !linkedFlag(t.id, c.k, c.key)) continue;      /* a hand edit there wins */
+      let nv;
+      if (c.nw === undefined) nv = undefined;                                  /* back to guidance here: back to guidance there */
+      else { const gA = gSrc[c.k] ? gSrc[c.k][i] : null, gB = gT[c.k] ? gT[c.k][i] : null; nv = adjust(c.k, p, c.nw, gA, gB, w); if (nv === undefined) continue; if (nv === gB && !/^(pp|lt)\d$|^g\d+$|^x/.test(c.k)) nv = undefined; }
+      const before = group.length;
+      setEdit(t.id, c.k, c.key, nv, group, nv !== undefined);
+      if (group.length > before) touched.set(t.id, w);
+    }
+  }
+  if (touched.size){
+    const part = [...touched].filter(([, w]) => w < 0.99).map(([id, w]) => `${SITES.find(x => x.id === id).name} at ${Math.round(w*100)}%`);
+    S.linkNote = `Also applied to ${touched.size} other point${touched.size === 1 ? "" : "s"}${part.length ? ` (${part.join(", ")})` : ""}. Undo reverses it everywhere; press Alt (Option) first to change one point only.`;
+  }
+  return touched.size;
+}
+/* store an edit, dropping it if it equals guidance */
+function writeCell(k, i, val, group){
+  const r = S.rows[i], p = P[k];
+  if (OF.o[k][i] === undefined && p.kind === "prob") return;
+  const g = OF.g[k] ? OF.g[k][i] : null;
+  if (val === null) return setEdit(prefs.site, k, r.key, undefined, group);
+  /* values that follow other cells (linked probabilities, peaks, WBGT, exceedances) keep any typed value as an edit */
+  const linked = /^(pp|lt)\d$|^g\d+$|^wbgt$|^x/.test(k);
+  const same = !linked && (p.kind === "sky" ? skyCat(val) === skyCat(g) && Math.abs(val - (g ?? -99)) < 1 : val === g);
+  setEdit(prefs.site, k, r.key, same ? undefined : val, group);
+}
+function commit(group){
+  if (!group.length) return;
+  S.linkNote = null;
+  const n = propagate(group);
+  S.undo.push(group); if (S.undo.length > 200) S.undo.shift(); S.redo = [];
+  saveEdits(); renderAll();
+  if (n && S.linkNote) toast(S.linkNote);
+}
+function applyGroup(group, dir){
+  for (const c of (dir < 0 ? [...group].reverse() : group)){
+    const e = edits[c.sid] = edits[c.sid] || {}; const m = e[c.k] = e[c.k] || {};
+    const v = dir < 0 ? c.old : c.nw; if (v === undefined) delete m[c.key]; else m[c.key] = v;
+    if (c.lo !== undefined) setLinkedFlag(c.sid, c.k, c.key, dir < 0 ? c.lo : c.ln);
+  }
+  saveEdits();
+  if (group[0] && group[0].sid !== prefs.site){ prefs.site = group[0].sid; savePrefs(); }
+  renderAll();
+}
+function undo(){ const g = S.undo.pop(); if (!g) return; S.redo.push(g); applyGroup(g, -1); toast("Undone"); }
+function redo(){ const g = S.redo.pop(); if (!g) return; S.undo.push(g); applyGroup(g, 1); }
+
+let editor = null;
+function cellEl(i, k){ return $("matrix").querySelector(`td.c[data-i="${i}"][data-k="${k}"]`); }
+function selectCell(i, k, scroll){
+  S.cur = { i, k };
+  $("matrix").querySelectorAll("td.cur").forEach(x => x.classList.remove("cur"));
+  const el = cellEl(i, k); if (el){ el.classList.add("cur"); if (scroll) el.scrollIntoView({ block:"nearest", inline:"nearest" }); }
+  if (viewOf(k) !== prefs.param && P[k].kind !== "sev"){ clearSel(); prefs.param = viewOf(k); savePrefs(); renderParams(); renderChart(); $("matrix").querySelectorAll("th.sel").forEach(x => x.classList.remove("sel")); keysOf(prefs.param).forEach(q => { const th = $("matrix").querySelector(`th[data-p="${q}"]`); if (th) th.classList.add("sel"); }); }
+}
+function openEditor(i, k, initial){
+  const el = cellEl(i, k); if (!el || el.classList.contains("na")) return;
+  const p = P[k], cur = OF.o[k][i];
+  closeEditor(false);
+  let inp;
+  if (p.kind === "sky" || p.kind === "sev"){
+    inp = document.createElement("select");
+    const opts = p.kind === "sky" ? SKY.map(x => x[0]) : SEV;
+    inp.innerHTML = opts.map(x => `<option value="${x}" ${(p.kind === "sky" ? skyCat(cur) : cur) === x ? "selected" : ""}>${p.kind === "sev" ? SEV_NAME[x] : x}</option>`).join("");
+    inp.addEventListener("change", () => finishEditor(true, 0));
+  } else {
+    inp = document.createElement("input"); inp.type = "text"; inp.inputMode = p.kind === "dir" ? "text" : "decimal";
+    inp.value = initial != null ? initial : p.kind === "prob" ? (cur == null ? "" : String(cur)) : fmt(p, cur);
+  }
+  el.appendChild(inp); editor = { i, k, inp };
+  inp.focus(); if (initial == null && inp.select) inp.select();
+  inp.addEventListener("keydown", ev => {
+    if (ev.key === "Enter"){ ev.preventDefault(); finishEditor(true, ...visStep(1, 0)); }
+    else if (ev.key === "Tab"){ ev.preventDefault(); finishEditor(true, ...visStep(0, ev.shiftKey ? -1 : 1)); }
+    else if (ev.key === "Escape"){ ev.preventDefault(); closeEditor(false); $("matrix").focus(); }
+    ev.stopPropagation();
+  });
+  inp.addEventListener("blur", () => setTimeout(() => { if (editor && editor.inp === inp) finishEditor(true, 0); }, 0));
+}
+function finishEditor(save, down, right){
+  if (!editor) return;
+  const { i, k, inp } = editor; editor = null;
+  if (save){
+    const v = parseInput(P[k], inp.value);
+    if (v === undefined){ toast(`Couldn't read "${inp.value}" as ${P[k].title.toLowerCase()}`); }
+    else { const g = []; writeCell(k, i, v, g); if (g.length) commit(g); }
+  }
+  if (inp.parentNode) inp.remove();
+  if (!save) return;
+  let ni = i, kidx = PARAMS.findIndex(p => p.k === k);
+  if (down > 0){ const sp = spanMap(k)[i]; ni = i + (sp && sp.s ? sp.s : 1); } else if (down < 0) ni = i - 1;
+  ni = Math.max(0, Math.min(S.rows.length - 1, ni));
+  if (right) kidx = Math.max(0, Math.min(PARAMS.length - 1, kidx + right));
+  ni = ownerIdx(PARAMS[kidx].k, ni);
+  renderMatrix(); selectCell(ni, PARAMS[kidx].k, true); $("matrix").focus({ preventScroll:true });
+}
+function closeEditor(){ if (editor){ editor.inp.remove(); editor = null; } }
+
+/* ============================================================
+   Graph editor
+   ============================================================ */
+const CH = { m:{ l:46, r:14, t:22, b:30 }, w:0, h:300, x:null, y:null, pts:[], drag:null };
+function chartDomain(p, pts, A, srcv){
+  if (p.kind === "prob" || p.kind === "sky") return [0, 100];
+  if (p.kind === "dir") return [0, 360];
+  let lo = Infinity, hi = -Infinity;
+  const acc = v => { if (v != null && isFinite(v)){ lo = Math.min(lo, v); hi = Math.max(hi, v); } };
+  pts.forEach(q => { acc(q.v); acc(q.g); });
+  (A.band[p.k] || []).forEach(b => { if (b){ acc(b[0]); acc(b[1]); } });
+  for (const id in (srcv || {})) (srcv[id] || []).forEach(acc);
+  if (!isFinite(lo)){ lo = 0; hi = 10; }
+  const padv = Math.max(2, (hi - lo)*0.1); lo -= padv; hi += padv;
+  if (p.lo === 0) lo = Math.max(0, lo);
+  if (p.unit === "kt") hi = Math.max(hi, 20);
+  /* on the exposure page keep the constraint limits in view */
+  if (EXPO){ const lims = p.unit === "kt" ? keysOf(prefs.param).flatMap(k => P[k].thr || []) : p.k === "t" ? PARAMS.filter(q => q.ex === "tmax" || q.ex === "tmin").map(q => q.v) : []; for (const v of lims){ hi = Math.max(hi, v + 3); lo = Math.min(lo, v - 3); } }
+  return [Math.floor(lo), Math.ceil(hi)];
+}
+function srcColor(id){ const s = ALL_SOURCES.find(x => x.id === id); return s ? FAMILIES[s.fam].color : "var(--ink-3)"; }
+const VIEWS = {
+  pp:   { title:"Precipitation probability", keys:["pp1","pp3","pp6"], names:["1 hr","3 hr","6 hr"], prob:true },
+  lt:   { title:"Lightning probability",     keys:["lt1","lt3","lt6"], names:["1 hr","3 hr","6 hr"], prob:true },
+};
+/* one combined sustained/peak view per wind height */
+function rebuildViews(){
+  for (const k of Object.keys(VIEWS)) if (/^w\d+$/.test(k)) delete VIEWS[k];
+  for (const ft of HEIGHTS) if (P["s" + ft] && P["g" + ft]) VIEWS["w" + ft] = { title:`${ft} ft wind`, chip:`${ft} ft`, keys:["s" + ft, "g" + ft], names:["Sustained","Peak"] };
+}
+rebuildViews();
+const viewOf = k => /^[sg]\d+$/.test(k) && VIEWS["w" + k.slice(1)] ? "w" + k.slice(1) : /^pp\d$/.test(k) && P.pp3 ? "pp" : /^lt\d$/.test(k) && P.lt3 ? "lt" : k;
+const isProbView = v => !!(VIEWS[v] && VIEWS[v].prob);
+/* the cell that sets a row's own value (1 hr on hourly rows, 3 hr on 3 h blocks, 6 hr on 6 h blocks) */
+const isBaseCell = (k, i) => { const p = P[k]; if (!p.win) return true; const len = S.rows[i].len; return p.win === (len === 1 ? 1 : len <= 3 ? 3 : 6); };
+const drawKey = ks => prefs.draw === "s" ? ks[0] : prefs.draw === "p" ? ks[1] : ks.includes(prefs.draw) ? prefs.draw : null;
+const keysOf = v => VIEWS[v] ? VIEWS[v].keys : [v];
+const seriesName = k => { const v = VIEWS[viewOf(k)]; return v ? v.names[v.keys.indexOf(k)] : P[k].title; };
+/* which series a drag edits in a combined view: nearest line, or the locked one */
+function pickKey(i, py){
+  const ks = keysOf(prefs.param); if (ks.length === 1) return ks[0];
+  const dk = drawKey(ks); if (dk) return dk;
+  let best = ks[0], d = Infinity;
+  for (const k of ks){ const v = OF.o[k][ownerIdx(k, i)]; if (v == null) continue; const dd = Math.abs(CH.y(Math.max(CH.y0, Math.min(CH.y1, v))) - py); if (dd < d){ d = dd; best = k; } }
+  return best;
+}
+/* Two layers: the background (grid, guidance, sources, member band) is drawn only when the parameter,
+   point or guidance changes; the foreground (official values, handles, selection) is redrawn while editing.
+   While dragging, the y-axis stays fixed so the background stays valid. */
+function renderChartFg(){ renderChart(true); }
+function renderChart(fgOnly){
+  if (!fgOnly) setTimeout(renderRecent, 0);
+  const svg = $("chart"), view = prefs.param, ks = keysOf(view), combo = ks.length > 1, p = P[ks[0]] || P.t, s = site();
+  $("ptitle").textContent = combo ? VIEWS[view].title : p.k === "xhot" ? `Temperature above ${hotOf(s)}°F` : p.title;
+  $("punit").textContent = p.kind === "prob" ? "percent chance" : p.kind === "sky" ? "percent cloud cover (categories at right)" : p.kind === "dir" ? "degrees true, toward the points" : isWind(p) ? wuLabel() : p.unit || "";
+  $("drawWrap").hidden = !(combo && prefs.cmode === "draw");
+  $("modeSel").querySelectorAll("button").forEach(b => b.setAttribute("aria-pressed", b.dataset.m === prefs.cmode));
+  $("phint").textContent = prefs.cmode === "draw"
+    ? "Drag across the graph to draw the forecast. Alt-drag erases back to guidance. Hold Ctrl to see the guidance values."
+    : "Click a point to select it, or drag across the graph to select several. Then drag a selected point, or use the arrow keys, to move them. Shift-click adds points. Hold Ctrl to see the guidance values.";
+  updateSelInfo();
+  const pview = isProbView(view);
+  if (!fgOnly) $("legend").innerHTML = pview
+    ? `<span><i class="bar"></i>1 hr</span><span><i class="off"></i>3 hr</span><span><i class="off pk"></i>6 hr</span><span><i class="gd"></i>Guidance</span>`
+    : `<span><i class="off"></i>${combo ? "Sustained" : "Official"}</span>${combo ? `<span><i class="off pk"></i>Peak</span>` : ""}<span><i class="gd"></i>Guidance blend</span><span><i class="src"></i>Sources</span><span><i class="bd"></i>Member 10th to 90th</span>`;
+  if (combo && !fgOnly){ const dk = drawKey(ks) || "n"; $("drawSel").innerHTML = `<button type="button" data-d="n" aria-pressed="${dk === "n"}" title="Draw whichever line you start nearest">Nearest</button>` + ks.map((k, j) => `<button type="button" data-d="${k}" aria-pressed="${dk === k}">${VIEWS[view].names[j]}</button>`).join(""); }
+  if (pview && prefs.cmode !== "draw") $("phint").textContent = (prefs.linkWin !== false ? "1, 3 and 6 hr are linked: change any of them and the others follow. " : "") + "Click a bar or step to select it, or drag across the graph to select the hourly or block values. Drag or use the arrow keys to move them. Hold Ctrl to see the guidance values.";
+  const W = svg.clientWidth || 900, Hh = CH.h; CH.w = W;
+  const A = S.agg[s.id] || { val:{}, srcv:{}, band:{} };
+  const rows = S.rows, n = rows.length, { o, g } = OF;
+  const srcOf = k => k.startsWith("x") ? OF.xsrc[k] : A.srcv[k] || {};
+  const ptsOf = k => rows.map((r, i) => ({ i, v:o[k][i], g:g[k] ? g[k][i] : null, ed: ((edits[s.id] || {})[k] || {})[r.key] !== undefined })).filter(q => q.v !== undefined);
+  const allPts = ks.flatMap(ptsOf); CH.pts = allPts; CH.hits = [];
+  const na = rows.map((r, i) => o[ks[0]][i] === undefined);   /* rows where this window doesn't apply: draw across them */
+  /* domain across every series in the view */
+  const merged = {}; ks.forEach((k, j) => { const sv = srcOf(k); for (const id in sv) merged[id + "_" + j] = sv[id]; });
+  const bandAll = { band:{ [p.k]: rows.map((r, i) => { const bs = ks.map(k => (A.band[k] || [])[i]).filter(Boolean); return bs.length ? [Math.min(...bs.map(b => b[0])), Math.max(...bs.map(b => b[1]))] : null; }) } };
+  const layoutKey = [view, s.id, svg.clientWidth || 900, zulu(), S.rows.length, wuLabel()].join("|");
+  const full = !fgOnly || !CH.layout || CH.layout.key !== layoutKey;
+  const sc = isWind(p) ? wfac() : 1;
+  const dom = full ? chartDomain(p, allPts, bandAll, merged) : null;
+  const [y0, y1] = !full ? [CH.layout.y0, CH.layout.y1] : sc === 1 ? dom : [Math.floor(dom[0]*sc), Math.ceil(dom[1]*sc)];
+  if (full) CH.layout = { key:layoutKey, y0, y1 };
+  const L = CH.m.l, R = W - CH.m.r, T = CH.m.t, B = Hh - CH.m.b;
+  const x = i => L + (i + 0.5) * (R - L)/n, yD = v => B - (v - y0)/(y1 - y0)*(B - T), y = v => yD(v*sc);
+  const colW = (R - L)/n;
+  const spanOf = (k, i) => { const sp = spanMap(k)[i]; return sp && sp.s ? sp.s : 1; };
+  const xk = k => i => L + (i + spanOf(k, i)/2) * colW;   /* centre of the period a value covers */
+  CH.xk = xk;
+  CH.sc = sc; CH.x = x; CH.y = y; CH.inv = py => y0 + (B - py)/(B - T)*(y1 - y0); CH.ix = px => Math.max(0, Math.min(n - 1, Math.floor((px - L)/((R - L)/n)))); CH.y0 = y0; CH.y1 = y1;
+  let h = "", f = "";
+  const z = zulu(); let start = 0, band = 0;
+  if (full) for (let i = 1; i <= n; i++){
+    if (i === n || dayKey(rows[i].a, z) !== dayKey(rows[start].a, z)){
+      const xa = L + start*(R - L)/n, xb = L + i*(R - L)/n;
+      if (band % 2 === 0) h += `<rect class="dayband" x="${xa}" y="${T}" width="${xb - xa}" height="${B - T}"/>`;
+      const Lb = dayLabel(rows[start].a, z); if (xb - xa > 34) h += `<text class="daylab" x="${xa + 5}" y="${T - 7}">${Lb.wd.slice(0,3)} ${Lb.dt}</text>`;
+      start = i; band++;
+    }
+  }
+  const step = p.kind === "dir" ? 90 : p.kind === "prob" || p.kind === "sky" ? 20 : niceStep((y1 - y0)/5);
+  if (full){
+  for (let v = Math.ceil(y0/step)*step; v <= y1 + 1e-9; v += step){ const yy = yD(v); h += `<line class="grid" x1="${L}" x2="${R}" y1="${yy}" y2="${yy}"/><text class="axis" x="${L - 7}" y="${yy + 4}" text-anchor="end">${p.kind === "dir" ? compass(v) : v}</text>`; }
+  rows.forEach((r, i) => { const hh = z ? new Date(r.a).getUTCHours() : r.lh; if (hh % 6 === 0 && (r.len < 6 || hh % 12 === 0)) h += `<text class="axis" x="${x(i)}" y="${B + 16}" text-anchor="middle">${pad2(hh)}</text>`; });
+  const tempThr = () => EXPO ? PARAMS.filter(q => q.ex === "tmax" || q.ex === "tmin").map(q => Math.round(q.v)) : [hotOf(s), 40, 32];
+  const thr = pview ? [] : combo ? [...new Set(ks.flatMap(k => P[k].thr || []))] : p.thr ? p.thr.slice() : p.k === "t" ? tempThr() : p.k === "wbgt" ? [82, 85, 88, 90] : [];
+  thr.filter(v => v*sc > y0 && v*sc < y1).forEach(v => { h += `<line class="thr" x1="${L}" x2="${R}" y1="${y(v)}" y2="${y(v)}"/><text class="thrlab" x="${R - 3}" y="${y(v) - 4}" text-anchor="end">${p.unit === "kt" ? Math.round(v*sc) + " " + wuLabel() : v + "°"}</text>`; });
+  if (p.kind === "sky") SKY.forEach(([c, a, b]) => { const yy = y(Math.min(100, (a + Math.min(b, 100))/2)); h += `<text class="thrlab" style="fill:var(--ink-3)" x="${R - 3}" y="${yy + 4}" text-anchor="end">${c}</text>`; if (a > 0) h += `<line class="grid" x1="${L}" x2="${R}" y1="${y(a)}" y2="${y(a)}" style="stroke-dasharray:2 3"/>`; });
+  }
+  const line = (arr, cls, style, xf) => { xf = xf || x; let d = "", pen = false; arr.forEach((v, i) => { if (v === undefined && na[i]) return; if (v == null || !isFinite(v)){ pen = false; return; } d += (pen ? "L" : "M") + xf(i).toFixed(1) + "," + y(Math.max(y0, Math.min(y1, v))).toFixed(1); pen = true; }); return d ? `<path class="${cls}" d="${d}" style="${style || ""}"/>` : ""; };
+  if (pview){
+    /* 1 hr as bars, 3 and 6 hr as steps over the periods they cover */
+    const pad = Math.min(3, colW*0.18);
+    ks.forEach((k, j) => {
+      ptsOf(k).forEach(q => {
+        const sp = spanOf(k, q.i), xa = L + q.i*colW, xb = L + (q.i + sp)*colW, id = k + "|" + q.i, sel = CH.sel.has(id);
+        if (full && q.g != null && q.g !== undefined) h += `<line class="gstep" x1="${(xa + pad).toFixed(1)}" x2="${(xb - pad).toFixed(1)}" y1="${y(q.g)}" y2="${y(q.g)}"/>`;
+        if (q.v == null) return;
+        const cy = y(Math.max(y0, Math.min(y1, q.v))), cx = (xa + xb)/2;
+        if (j === 0) f += `<rect class="pbar ${q.ed ? "e" : ""} ${sel ? "s" : ""}" x="${(xa + pad).toFixed(1)}" y="${cy.toFixed(1)}" width="${Math.max(1, xb - xa - 2*pad).toFixed(1)}" height="${Math.max(0, B - cy).toFixed(1)}"/>`;
+        else f += `<line class="pstep s${j} ${sel ? "s" : ""}" x1="${(xa + pad).toFixed(1)}" x2="${(xb - pad).toFixed(1)}" y1="${cy}" y2="${cy}"/>`;
+        CH.hits.push({ k, i:q.i, x:cx, y:cy });
+        if (sel) f += `<circle class="selring" cx="${cx}" cy="${cy}" r="7.5"/>`;
+        f += `<circle class="h ${j === 2 ? "pk" : ""} ${j === 0 ? "b" : ""} ${q.ed ? "e" : ""} ${sel ? "s" : ""}" cx="${cx}" cy="${cy}" r="${sel ? 4.6 : j === 0 ? 2.4 : 3.2}"/>`;
+      });
+    });
+  } else {
+  if (full) ks.forEach((k, j) => {
+    const bnd = A.band[k] || [];
+    if (p.kind !== "dir" && bnd.some(b => b)){
+      let seg = [];
+      const flush = () => { if (seg.length > 1) h += `<path class="band ${j ? "pk" : ""}" d="M${seg.map(i => `${x(i)},${y(Math.max(y0, Math.min(y1, bnd[i][1])))}`).join("L")}L${seg.slice().reverse().map(i => `${x(i)},${y(Math.max(y0, Math.min(y1, bnd[i][0])))}`).join("L")}Z"/>`; seg = []; };
+      rows.forEach((r, i) => { if (bnd[i]) seg.push(i); else flush(); }); flush();
+    }
+  });
+  if (full) ks.forEach((k, j) => {
+    const srcv = srcOf(k);
+    for (const id in srcv){
+      const arr = rows.map((r, i) => srcv[id][i]);
+      if (p.kind === "dir"){ arr.forEach((v, i) => { if (v != null) h += `<circle cx="${x(i)}" cy="${y(v)}" r="1.8" fill="${srcColor(id)}" opacity=".45"/>`; }); }
+      else h += line(arr, "src", `stroke:${srcColor(id)}${j ? ";stroke-dasharray:3 2" : ""}`, xk(k));
+    }
+  });
+  ks.forEach((k, j) => {
+    const garr = rows.map((r, i) => g[k] ? g[k][i] : null), oarr = rows.map((r, i) => o[k][i]);
+    const xf = xk(k);
+    if (P[k].win > 1) ptsOf(k).forEach(q => { if (q.v == null) return; const sp = spanOf(k, q.i); if (sp > 1) f += `<line class="spanbar ${j ? "pk" : ""}" x1="${(L + q.i*colW + 2).toFixed(1)}" x2="${(L + (q.i + sp)*colW - 2).toFixed(1)}" y1="${y(q.v)}" y2="${y(q.v)}"/>`; });
+    if (p.kind !== "dir"){ if (full) h += line(garr, "guide", "", xf); f += line(oarr, "off" + (j ? " pk" : ""), "", xf); }
+    ptsOf(k).forEach(q => {
+      if (q.v == null) return;
+      const cx = xf(q.i), cy = y(Math.max(y0, Math.min(y1, q.v))), id = k + "|" + q.i;
+      CH.hits.push({ k, i:q.i, x:cx, y:cy });
+      if (CH.sel.has(id)) f += `<circle class="selring" cx="${cx}" cy="${cy}" r="7.5"/>`;
+      f += `<circle class="h ${j ? "pk" : ""} ${q.ed ? "e" : ""} ${CH.sel.has(id) ? "s" : ""}" cx="${cx}" cy="${cy}" r="${CH.sel.has(id) ? 4.6 : n > 90 ? 2.6 : 3.4}"/>`;
+    });
+    if (combo){ const last = ptsOf(k).filter(q => q.v != null).pop(); if (last) f += `<text class="serlab ${j ? "pk" : ""}" x="${x(last.i) + 6}" y="${y(last.v) + 4}">${j ? "Pk" : "Sus"}</text>`; }
+  });
+  }
+  if (CH.drag && CH.drag.kind === "marq"){ const d = CH.drag; f += `<rect class="marq" x="${Math.min(d.x0, d.x1)}" y="${Math.min(d.y0, d.y1)}" width="${Math.abs(d.x1 - d.x0)}" height="${Math.abs(d.y1 - d.y0)}"/>`; }
+  if (!allPts.some(q => q.v != null)) f += `<text class="axis" x="${(L + R)/2}" y="${(T + B)/2}" text-anchor="middle" style="font-size:14px">${S.loading ? "Loading guidance" : "No guidance for this parameter. Drag on the graph to draw a forecast."}</text>`;
+  CH.cursorY = [T, B];
+  if (full){
+    svg.setAttribute("viewBox", `0 0 ${W} ${Hh}`); svg.style.height = Hh + "px";
+    svg.innerHTML = `<g id="chBg">${h}</g><g id="chFg">${f}</g><line id="chCur" class="cursor" x1="0" x2="0" y1="${T}" y2="${B}" style="display:none"/>`;
+  } else $("chFg").innerHTML = f;
+  moveCursor(S.hoverRow);
+}
+/* hover cursor: move one line instead of redrawing */
+function moveCursor(i){
+  const c = document.getElementById("chCur"); if (!c) return;
+  if (i == null || !CH.x){ c.style.display = "none"; return; }
+  const xx = CH.x(i); c.setAttribute("x1", xx); c.setAttribute("x2", xx); c.style.display = "";
+}
+function niceStep(s){ const e = Math.pow(10, Math.floor(Math.log10(s))); const f = s/e; return (f < 1.5 ? 1 : f < 3 ? 2 : f < 7 ? 5 : 10)*e; }
+function chartValue(py, k){
+  const p = P[k];
+  if (isWind(p) && (CH.sc || 1) !== 1){ const vd = Math.max(0, Math.round(CH.inv(py))); return Math.round(vd/CH.sc*10)/10; }
+  let v = CH.inv(py);
+  v = Math.max(p.lo ?? CH.y0, Math.min(p.hi ?? CH.y1, v));
+  const st = p.step || 1; v = Math.round(v/st)*st;
+  if (p.kind === "dir") v = ((v % 360) + 360) % 360;
+  return v;
+}
+function paintRange(k, i0, v0, i1, v1, erase){
+  const lo = Math.min(i0, i1), hi = Math.max(i0, i1);
+  for (let i = lo; i <= hi; i++){
+    if (OF.o[k][i] === undefined) continue;
+    const f = i1 === i0 ? 1 : (i - i0)/(i1 - i0);
+    let v = v0 + (v1 - v0)*f; const st = P[k].step || 1; v = Math.round(v/st)*st;
+    writeCell(k, i, erase ? null : v, CH.drag.group);
+  }
+}
+let tableTimer = null;
+let liveFrame = 0;
+function liveRefresh(){
+  if (liveFrame) return;
+  liveFrame = requestAnimationFrame(() => {
+    liveFrame = 0;
+    OF = officialFor(prefs.site, true);
+    renderChartFg();
+    if (!tableTimer) tableTimer = setTimeout(() => { tableTimer = null; updateCells(keysOf(prefs.param)); }, 120);
+  });
+}
+/* update only the matrix cells of the parameters being edited */
+function updateCells(ks){
+  const mx = $("matrix"), s = site(), e = edits[s.id] || {};
+  const extra = { t:["wbgt"], td:["wbgt"] }; PARAMS.filter(p => p.peakOf).forEach(p => extra[p.peakOf] = [p.k]);
+  const all = new Set(ks); ks.forEach(k => (extra[k] || []).forEach(x => all.add(x)));
+  for (const k of all){
+    const p = P[k]; if (!p) continue;
+    mx.querySelectorAll(`td.c[data-k="${k}"]`).forEach(td => {
+      const i = +td.dataset.i, v = OF.o[k][i]; if (v === undefined) return;
+      const txt = across() && p.kind === "sev" && v !== "-" ? v : fmt(p, v);
+      if (td.textContent !== txt && !td.querySelector("input,select")) td.textContent = txt;
+      td.style.cssText = tint(p, v);
+      td.classList.toggle("ed", e[k] && e[k][S.rows[i].key] !== undefined);
+      td.classList.toggle("lk", !!(e[k] && e[k][S.rows[i].key] !== undefined && linkedFlag(prefs.site, k, S.rows[i].key)));
+    });
+  }
+}
+function chartPos(ev){ const r = $("chart").getBoundingClientRect(); return { px: (ev.clientX - r.left) * (CH.w / r.width), py: (ev.clientY - r.top) * (CH.h / r.height) }; }
+/* ---------- selection helpers ---------- */
+CH.sel = new Set();
+function clearSel(){ CH.sel = new Set(); }
+function selList(){ return [...CH.sel].map(id => { const [k, i] = id.split("|"); return { k, i:+i }; }).filter(q => OF.o[q.k] && OF.o[q.k][q.i] != null); }
+const rawEdit = (k, key) => ((edits[prefs.site] || {})[k] || {})[key];
+function hitTest(px, py){
+  let best = null, d = Infinity;
+  for (const h of CH.hits){ const dd = Math.hypot((h.x - px)*1.0, (h.y - py)*0.8); if (dd < d){ d = dd; best = h; } }
+  return d <= 14 ? best : null;
+}
+function updateSelInfo(){
+  const n = CH.sel.size, el = $("selinfo"); if (!el) return;
+  el.textContent = n ? `${n} point${n > 1 ? "s" : ""} selected` : "";
+  const scope = n ? `${n} point${n > 1 ? "s" : ""}` : "all";
+  $("nudgeUp").textContent = `Raise ${scope}`; $("nudgeDn").textContent = `Lower ${scope}`;
+  $("resetParam").textContent = n ? "Reset selected to guidance" : "Reset parameter to guidance";
+  $("setGo").textContent = n ? `Set ${scope}` : "Set all";
+}
+/* apply f(value, k) -> new value to the selection (or every point of the view) as one undo step */
+function applyToPoints(f, list){
+  const g = [];
+  for (const q of list){ const v = OF.o[q.k][q.i]; if (v == null || v === undefined) continue; writeCell(q.k, q.i, f(v, q.k), g); }
+  commit(g); return g.length;
+}
+function scopePoints(){
+  if (CH.sel.size) return selList();
+  const out = [], pv = isProbView(prefs.param), locked = toolKeysG().length === 1 && keysOf(prefs.param).length > 1;
+  for (const k of toolKeysG()) S.rows.forEach((r, i) => { if (OF.o[k][i] != null && (!pv || locked || isBaseCell(k, i))) out.push({ k, i }); });
+  return out;
+}
+const toolKeysG = () => { const ks = keysOf(prefs.param); const dk = ks.length > 1 && prefs.cmode === "draw" ? drawKey(ks) : null; return dk ? [dk] : ks; };
+const clampV = (k, v) => { const p = P[k], st = p.step || 1; v = Math.round(v/st)*st; if (p.kind === "dir") return ((v % 360) + 360) % 360; if (p.lo != null) v = Math.max(p.lo, v); if (p.hi != null) v = Math.min(p.hi, v); return v; };
+function nudgeSel(d){ const n = applyToPoints((v, k) => clampV(k, v + d*(P[k].step || 1)), scopePoints()); if (!n) toast("Nothing to move"); }
+
+/* ---------- chart interaction ---------- */
+const MOUSE = { x:0, y:0, i:null, in:false, ctrl:false };
+function bindChart(){
+  const svg = $("chart");
+  svg.addEventListener("pointerdown", ev => {
+    if (ev.button !== 0 || P[keysOf(prefs.param)[0]].kind === "sev") return;
+    svg.focus({ preventScroll:true });
+    svg.setPointerCapture(ev.pointerId);
+    const { px, py } = chartPos(ev);
+    $("tip").style.display = "none";
+    if (prefs.cmode === "draw"){
+      const i = CH.ix(px), k = pickKey(i, py), v = chartValue(py, k);
+      CH.drag = { kind:"paint", k, i, v, erase: ev.altKey, group: [] };
+      paintRange(k, i, v, i, v, ev.altKey); liveRefresh(); return;
+    }
+    const hit = hitTest(px, py);
+    if (hit){
+      const id = hit.k + "|" + hit.i;
+      if (ev.shiftKey){ if (CH.sel.has(id)) CH.sel.delete(id); else CH.sel.add(id); }
+      else if (!CH.sel.has(id)) CH.sel = new Set([id]);
+      const snap = selList().map(q => ({ ...q, key:S.rows[q.i].key, val:OF.o[q.k][q.i], raw:rawEdit(q.k, S.rows[q.i].key) }));
+      CH.drag = { kind:"move", py0:py, moved:false, snap };
+      svg.style.cursor = "ns-resize";
+    } else {
+      CH.drag = { kind:"marq", x0:px, y0:py, x1:px, y1:py, base: ev.shiftKey ? new Set(CH.sel) : new Set() };
+    }
+    renderChartFg();
+  });
+  let pmEv = null, pmFrame = 0;
+  svg.addEventListener("pointermove", ev => {
+    pmEv = ev; if (pmFrame) return;
+    pmFrame = requestAnimationFrame(() => { pmFrame = 0; const e = pmEv; pmEv = null; if (e) onMove(e); });
+  });
+  const onMove = ev => {
+    const { px, py } = chartPos(ev); const i = CH.ix(px);
+    MOUSE.x = ev.clientX; MOUSE.y = ev.clientY; MOUSE.i = i; MOUSE.in = true;
+    const d = CH.drag;
+    if (d && d.kind === "paint"){ const v = chartValue(py, d.k); paintRange(d.k, d.i, d.v, i, v, d.erase || ev.altKey); d.i = i; d.v = v; liveRefresh(); }
+    else if (d && d.kind === "move"){
+      const dv = (CH.inv(py) - CH.inv(d.py0))/(CH.sc || 1);
+      if (!d.moved && Math.abs(py - d.py0) < 3) return;
+      d.moved = true;
+      const tmp = [];
+      for (const q of d.snap){ writeCell(q.k, q.i, clampV(q.k, q.val + dv), tmp); }
+      liveRefresh();
+    }
+    else if (d && d.kind === "marq"){
+      d.x1 = px; d.y1 = py;
+      const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1), y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+      const sel = new Set(d.base);
+      /* a thin drag selects every point in those columns; a box selects only the points inside it */
+      const tall = y1 - y0 < 6;
+      const pv = isProbView(prefs.param);
+      for (const h of CH.hits) if (h.x >= x0 && h.x <= x1 && (tall ? (!pv || isBaseCell(h.k, h.i)) : (h.y >= y0 && h.y <= y1))) sel.add(h.k + "|" + h.i);
+      CH.sel = sel; renderChartFg();
+    }
+    else {
+      const hit = prefs.cmode === "select" ? hitTest(px, py) : null;
+      svg.style.cursor = hit ? (CH.sel.has(hit.k + "|" + hit.i) ? "ns-resize" : "pointer") : prefs.cmode === "draw" ? "crosshair" : "default";
+    }
+    hover(i, ev);
+  };
+  const end = () => {
+    if (pmFrame){ cancelAnimationFrame(pmFrame); pmFrame = 0; if (pmEv){ const e = pmEv; pmEv = null; onMove(e); } }
+    if (liveFrame){ cancelAnimationFrame(liveFrame); liveFrame = 0; }
+    const d = CH.drag; if (!d) return; CH.drag = null;
+    if (d.kind === "paint"){ if (d.group.length){ S.undo.push(d.group); S.redo = []; saveEdits(); } renderAll(); return; }
+    if (d.kind === "move"){
+      if (d.moved){
+        const g = [];
+        for (const q of d.snap){ const nw = rawEdit(q.k, q.key); if (nw !== q.raw) g.push({ sid:prefs.site, k:q.k, key:q.key, old:q.raw, nw }); }
+        if (g.length){ S.undo.push(g); S.redo = []; saveEdits(); }
+      }
+      renderAll(); return;
+    }
+    if (d.kind === "marq"){ if (Math.abs(d.x1 - d.x0) < 4 && Math.abs(d.y1 - d.y0) < 4 && !d.base.size) clearSel(); renderChartFg(); }
+  };
+  svg.addEventListener("pointerup", end); svg.addEventListener("pointercancel", end);
+  svg.addEventListener("pointerleave", () => { MOUSE.in = false; if (!CH.drag){ hover(null); } });
+  svg.addEventListener("dblclick", ev => { const { px, py } = chartPos(ev); const hit = hitTest(px, py); if (!hit) return; const g = []; writeCell(hit.k, hit.i, null, g); commit(g); });
+  svg.addEventListener("keydown", ev => {
+    if (ev.key === "ArrowUp" || ev.key === "ArrowDown"){ ev.preventDefault(); if (!CH.sel.size){ toast("Select points first (click, or drag across the graph)"); return; } nudgeSel((ev.key === "ArrowUp" ? 1 : -1)*(ev.shiftKey ? 5 : 1)); }
+    else if (ev.key === "ArrowLeft" || ev.key === "ArrowRight"){
+      ev.preventDefault(); if (CH.sel.size !== 1) return;
+      const q = selList()[0]; if (!q) return; const pts = CH.hits.filter(h => h.k === q.k).sort((a, b) => a.i - b.i);
+      const j = pts.findIndex(h => h.i === q.i) + (ev.key === "ArrowRight" ? 1 : -1); if (pts[j]){ CH.sel = new Set([q.k + "|" + pts[j].i]); renderChartFg(); }
+    }
+    else if (ev.key === "Delete" || ev.key === "Backspace"){ ev.preventDefault(); if (CH.sel.size) applyToPoints(() => null, selList()); }
+    else if (ev.key === "Escape"){ clearSel(); renderChartFg(); }
+    else if ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === "a"){ ev.preventDefault(); CH.sel = new Set(CH.hits.map(h => h.k + "|" + h.i)); renderChartFg(); }
+  });
+  /* hold Ctrl (or Cmd) to see the values under the cursor */
+  const ctrlState = ev => { const on = ev.ctrlKey || ev.metaKey; if (on !== MOUSE.ctrl){ MOUSE.ctrl = on; if (MOUSE.in && MOUSE.i != null) hover(MOUSE.i, { clientX:MOUSE.x, clientY:MOUSE.y, ctrlKey:on, metaKey:false }); else $("tip").style.display = "none"; } };
+  window.addEventListener("keydown", ctrlState); window.addEventListener("keyup", ctrlState);
+  window.addEventListener("blur", () => { MOUSE.ctrl = false; $("tip").style.display = "none"; });
+  window.addEventListener("resize", () => renderChart());
+}
+function hover(i, ev){
+  const tip = $("tip");
+  if (S.hoverRow !== i){ S.hoverRow = i; markHover(i); moveCursor(i); }
+  if (i == null || !ev || CH.drag || !(ev.ctrlKey || ev.metaKey)){ tip.style.display = "none"; return; }
+  const ks = keysOf(prefs.param), combo = ks.length > 1, p = P[ks[0]], s = site(), A = S.agg[s.id] || { srcv:{} };
+  const r = S.rows[i];
+  const srcOf = k => k.startsWith("x") ? OF.xsrc[k] : (A.srcv[k] || {});
+  const f = v => v == null || v === undefined ? "–" : isWind(p) ? `${Math.round(v*wfac())} ${wuLabel()}` : p.kind === "sky" ? `${Math.round(v)}% ${skyCat(v)}` : p.kind === "dir" ? `${Math.round(v)}° ${compass(v)}` : p.kind === "prob" ? `${Math.round(v)}%` : `${Math.round(v)}${p.unit === "°F" ? "°" : ""}`;
+  const fv = getter => ks.map(k => f(getter(k, ownerIdx(k, i)))).join(" / ");
+  const Ld = dayLabel(r.a, zulu()), oi = ownerIdx(ks[ks.length - 1], i), sp = spanMap(ks[ks.length - 1])[oi], end = S.rows[oi + (sp.s || 1) - 1].b;
+  let h = `<div><b>${Ld.wd.slice(0,3)} ${Ld.dt}, ${hhmm(r.a, zulu())}${sp.s > 1 || r.len > 1 ? "–" + hhmm(end, zulu()) : ""}${zulu() ? "Z" : ""}</b></div>`;
+  if (combo) h += `<div class="r mut"><span></span><span>${VIEWS[prefs.param].names.map(x => x.replace("Sustained", "sust").replace("Peak", "peak")).join(" / ")}</span></div>`;
+  h += `<div class="r"><span>Official</span><span>${fv((k, j) => OF.o[k][j])}</span></div><div class="r mut"><span>Guidance</span><span>${fv((k, j) => OF.g[k] ? OF.g[k][j] : null)}</span></div>`;
+  const ids = [...new Set(ks.flatMap(k => Object.keys(srcOf(k))))].filter(id => ks.some(k => (srcOf(k)[id] || [])[ownerIdx(k, i)] != null)).sort((a, b) => ALL_SOURCES.findIndex(x => x.id === a) - ALL_SOURCES.findIndex(x => x.id === b));
+  ids.slice(0, 16).forEach(id => { const d = ALL_SOURCES.find(x => x.id === id); h += `<div class="r mut"><span>${d ? d.name : id}</span><span>${fv((k, j) => (srcOf(k)[id] || [])[j])}</span></div>`; });
+  tip.innerHTML = h; tip.style.display = "block";
+  const wrap = $("chartwrap").getBoundingClientRect(); let lx = ev.clientX - wrap.left + 16; if (lx + 210 > wrap.width) lx = ev.clientX - wrap.left - 226;
+  tip.style.left = lx + "px"; tip.style.top = Math.max(0, Math.min(wrap.height - tip.offsetHeight, ev.clientY - wrap.top - 20)) + "px";
+}
+
+/* ============================================================
+   Publish: Excel (hand-built xlsx) + CSV
+   ============================================================ */
+const CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++){ let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function crc32(b){ let c = 0xFFFFFFFF; for (let i = 0; i < b.length; i++) c = CRC[(c ^ b[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+/* ---------- 45 WS logo for published products ---------- */
+let LOGO = null;
+/* decode an image into what the PDF writer needs: RGB plus a separate alpha mask */
+
+async function loadLogo(){
+  if (LOGO !== null) return LOGO;
+  try {
+    const r = await fetch(LOGO_SRC); if (!r.ok) throw new Error("no logo");
+    const png = new Uint8Array(await r.arrayBuffer());
+    const img = await createImageBitmap(new Blob([png], { type:"image/png" }));
+    const rh = 200, rw = Math.round(img.width*rh/img.height);
+    const c = document.createElement("canvas"); c.width = rw; c.height = rh;
+    /* keep the transparency: colour channels plus a separate alpha mask (PDF soft mask) */
+    const x = c.getContext("2d"); x.drawImage(img, 0, 0, rw, rh);
+    const d = x.getImageData(0, 0, rw, rh).data, rgb = new Uint8Array(rw*rh*3), alpha = new Uint8Array(rw*rh);
+    for (let i = 0, j = 0, k = 0; i < d.length; i += 4, k++){ rgb[j++] = d[i]; rgb[j++] = d[i + 1]; rgb[j++] = d[i + 2]; alpha[k] = d[i + 3]; }
+    let bin = ""; for (let i = 0; i < png.length; i += 0x8000) bin += String.fromCharCode.apply(null, png.subarray(i, i + 0x8000));
+    LOGO = { png, w: img.width, h: img.height, rgb, alpha, rw, rh, b64: btoa(bin) };
+  } catch (e) { LOGO = false; }
+  return LOGO;
+}
+function zip(files){
+  const enc = new TextEncoder(), parts = [], central = []; let off = 0;
+  const d = new Date(), dt = ((d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1)) & 0xFFFF, dd = (((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate()) & 0xFFFF;
+  for (const [name, text] of files){
+    const nb = enc.encode(name), data = typeof text === "string" ? enc.encode(text) : text, crc = crc32(data);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true); lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true); lh.setUint16(10, dt, true); lh.setUint16(12, dd, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, data.length, true); lh.setUint32(22, data.length, true); lh.setUint16(26, nb.length, true); lh.setUint16(28, 0, true);
+    parts.push(new Uint8Array(lh.buffer), nb, data);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true); ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true); ch.setUint16(12, dt, true); ch.setUint16(14, dd, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, data.length, true); ch.setUint32(24, data.length, true); ch.setUint16(28, nb.length, true); ch.setUint32(42, off, true);
+    central.push(new Uint8Array(ch.buffer), nb);
+    off += 30 + nb.length + data.length;
+  }
+  const csz = central.reduce((a, b) => a + b.length, 0);
+  const end = new DataView(new ArrayBuffer(22));
+  end.setUint32(0, 0x06054b50, true); end.setUint16(8, files.length, true); end.setUint16(10, files.length, true); end.setUint32(12, csz, true); end.setUint32(16, off, true);
+  return new Blob([...parts, ...central, new Uint8Array(end.buffer)], { type:"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+}
+const xesc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const colName = c => { let s = ""; c++; while (c > 0){ const m = (c - 1) % 26; s = String.fromCharCode(65 + m) + s; c = Math.floor((c - 1)/26); } return s; };
+const XSTYLES = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="6"><font><sz val="10"/><name val="Arial"/></font><font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/></font><font><b/><sz val="15"/><color rgb="FF13202E"/><name val="Arial"/></font><font><sz val="9"/><color rgb="FF4B5A68"/><name val="Arial"/></font><font><b/><sz val="10"/><color rgb="FF13202E"/><name val="Arial"/></font><font><b/><sz val="9"/><color rgb="FF13202E"/><name val="Arial"/></font></fonts>
+<fills count="5"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FF13202E"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFE6EBED"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF4F7F7"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="3"><border><left/><right/><top/><bottom/><diagonal/></border><border><left style="thin"><color rgb="FFD4DBDF"/></left><right style="thin"><color rgb="FFD4DBDF"/></right><top style="thin"><color rgb="FFD4DBDF"/></top><bottom style="thin"><color rgb="FFD4DBDF"/></bottom><diagonal/></border><border><left style="thin"><color rgb="FFD4DBDF"/></left><right style="thin"><color rgb="FFD4DBDF"/></right><top style="medium"><color rgb="FF13202E"/></top><bottom style="thin"><color rgb="FFD4DBDF"/></bottom><diagonal/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="13">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="2" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="3" fillId="0" borderId="0" xfId="0" applyFont="1"/>
+<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="5" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="1" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="9" fontId="0" fillId="0" borderId="1" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="4" fillId="4" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="2" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="1" fontId="0" fillId="0" borderId="2" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="9" fontId="0" fillId="0" borderId="2" xfId="0" applyNumberFormat="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center"/></xf>
+<xf numFmtId="0" fontId="4" fillId="4" borderId="2" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="left" vertical="center"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>`;
+function sheetXML(sh){
+  let x = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">`;
+  x += `<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr><sheetViews><sheetView workbookViewId="0" zoomScale="100" showGridLines="${sh.grid === false ? 0 : 1}">${sh.freeze ? `<pane xSplit="${sh.freeze.c}" ySplit="${sh.freeze.r}" topLeftCell="${colName(sh.freeze.c)}${sh.freeze.r + 1}" activePane="bottomRight" state="frozen"/>` : ""}</sheetView></sheetViews>`;
+  x += `<sheetFormatPr defaultRowHeight="15"/><cols>${sh.cols.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w}" customWidth="1"/>`).join("")}</cols><sheetData>`;
+  sh.rows.forEach((row, ri) => {
+    const ht = sh.heights && sh.heights[ri];
+    x += `<row r="${ri + 1}"${ht ? ` ht="${ht}" customHeight="1"` : ""}>`;
+    row.forEach((c, ci) => {
+      if (!c) return; const ref = colName(ci) + (ri + 1); const st = c.s ? ` s="${c.s}"` : "";
+      if (c.v === null || c.v === undefined || c.v === "") x += `<c r="${ref}"${st}/>`;
+      else if (typeof c.v === "number") x += `<c r="${ref}"${st}><v>${c.v}</v></c>`;
+      else x += `<c r="${ref}"${st} t="inlineStr"><is><t xml:space="preserve">${xesc(c.v)}</t></is></c>`;
+    });
+    x += `</row>`;
+  });
+  x += `</sheetData>`;
+  if (sh.merges.length) x += `<mergeCells count="${sh.merges.length}">${sh.merges.map(m => `<mergeCell ref="${m}"/>`).join("")}</mergeCells>`;
+  (sh.cf || []).forEach((ref, i) => { x += `<conditionalFormatting sqref="${ref}"><cfRule type="colorScale" priority="${i + 1}"><colorScale><cfvo type="num" val="0"/><cfvo type="num" val="1"/><color rgb="FFFFFFFF"/><color rgb="FF6FAFB6"/></colorScale></cfRule></conditionalFormatting>`; });
+  x += `<pageMargins left="0.3" right="0.3" top="0.4" bottom="0.4" header="0.2" footer="0.2"/><pageSetup orientation="landscape" fitToWidth="1" fitToHeight="0"/>${sh.logo ? `<drawing r:id="rId1"/>` : ""}</worksheet>`;
+  return x;
+}
+function workbook(sheets, logo){
+  if (logo) sheets.forEach(s => s.logo = true);
+  const files = [
+    ["[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>${sheets.map((s, i) => `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")}<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/></Types>`],
+    ["_rels/.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/></Relationships>`],
+    ["docProps/core.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dcterms="http://purl.org/dc/terms/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><dc:title>Daily Planning Forecast</dc:title><dcterms:created xsi:type="dcterms:W3CDTF">${new Date().toISOString().slice(0,19)}Z</dcterms:created></cp:coreProperties>`],
+    ["xl/workbook.xml", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView/></bookViews><sheets>${sheets.map((s, i) => `<sheet name="${xesc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`).join("")}</sheets></workbook>`],
+    ["xl/_rels/workbook.xml.rels", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${sheets.map((s, i) => `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet${i + 1}.xml"/>`).join("")}<Relationship Id="rId${sheets.length + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>`],
+    ["xl/styles.xml", XSTYLES],
+    ...sheets.map((s, i) => [`xl/worksheets/sheet${i + 1}.xml`, sheetXML(s)]),
+  ];
+  if (logo){
+    const cy = Math.round(62*12700), cx = Math.round(62*logo.w/logo.h*12700);
+    files[0][1] = files[0][1].replace('<Default Extension="xml"', '<Default Extension="png" ContentType="image/png"/><Default Extension="xml"').replace("</Types>", sheets.map((s, i) => `<Override PartName="/xl/drawings/drawing${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/>`).join("") + "</Types>");
+    files.push(["xl/media/image1.png", logo.png]);
+    sheets.forEach((s, i) => {
+      const col = Math.max(0, s.cols.length - 1);
+      files.push([`xl/worksheets/_rels/sheet${i + 1}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" Target="../drawings/drawing${i + 1}.xml"/></Relationships>`]);
+      files.push([`xl/drawings/_rels/drawing${i + 1}.xml.rels`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image1.png"/></Relationships>`]);
+      files.push([`xl/drawings/drawing${i + 1}.xml`, `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><xdr:oneCellAnchor><xdr:from><xdr:col>${col}</xdr:col><xdr:colOff>76200</xdr:colOff><xdr:row>0</xdr:row><xdr:rowOff>25400</xdr:rowOff></xdr:from><xdr:ext cx="${cx}" cy="${cy}"/><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" name="45 WS"/><xdr:cNvPicPr><a:picLocks noChangeAspect="1"/></xdr:cNvPicPr></xdr:nvPicPr><xdr:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></xdr:blipFill><xdr:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></xdr:spPr></xdr:pic><xdr:clientData/></xdr:oneCellAnchor></xdr:wsDr>`]);
+    });
+  }
+  return zip(files);
+}
+const xcols = () => ["Day","Time","Period", ...PARAMS.map(p => p.k)];
+/* product name for titles, sheets and files */
+const FILE_BASE = () => PERSONAL ? ((prefs.exp && prefs.exp.title || "Forecast").replace(/[^A-Za-z0-9]+/g, "_").replace(/^_|_$/g, "") || "Forecast") : EXPO ? ((prefs.exp && prefs.exp.op ? prefs.exp.op.replace(/[^A-Za-z0-9]+/g, "_") + "_" : "") + (BURN ? "Burn_Forecast" : "Exposure_Forecast")) : "Planning_Forecast";
+const productName = s => PERSONAL ? ((prefs.exp && prefs.exp.title) || "Forecast") : EXPO ? `${(prefs.exp && prefs.exp.op) ? prefs.exp.op + " " : ""}${BURN ? "Burn Forecast" : "Exposure Forecast"}` : "Daily Planning Forecast";
+/* prescription in words, plus the hours the official forecast meets every criterion */
+function burnSummary(){
+  const exp = prefs.exp || expStored, cons = (exp.constraints || []).filter(c => RXF[c.f]);
+  if (!cons.length) return "No prescription set.";
+  const rx = "Prescription: " + cons.map(c => { const f = RXF[c.f]; return f.sector ? `${f.l} from ${rxValueText(c)}` : `${f.short} ${opText(c.op)} ${rxValueText(c)}`; }).join("; ") + ".";
+  if (!S.rows || !S.G[prefs.site]) return rx;
+  const OFs = officialFor(prefs.site), o = OFs.o, ok = [];
+  S.rows.forEach((r, i) => {
+    let good = true;
+    for (const c of cons){
+      const f = RXF[c.f], key = f.sector ? "dir" : f.key, x = o[key] ? o[key][i] : null; if (x == null){ good = false; break; }
+      const v = f.wind ? (+c.v)*(WIND_UNITS[c.unit || "mph"] || 1) : +c.v;
+      const pass = f.sector ? inSector(x, +c.v, +c.v2) : c.op === ">=" ? x >= v : c.op === ">" ? x > v : c.op === "<=" ? x <= v : x < v;
+      if (!pass){ good = false; break; }
+    }
+    if (good) ok.push(r);
+  });
+  if (!ok.length) return rx + " Forecast: no hours fully in prescription.";
+  const spans = []; ok.forEach(r => { const l = spans[spans.length - 1]; if (l && l.b === r.a) l.b = r.b; else spans.push({ a:r.a, b:r.b }); });
+  const t = ms => hhmm(ms, zulu()) + (zulu() ? "Z" : "L");
+  return rx + " Forecast in prescription: " + spans.map(sp => `${dayLabel(sp.a, zulu()).wd.slice(0, 3)} ${t(sp.a)}–${t(sp.b)}`).join(", ") + ".";
+}
+function siteSheet(s, OFs, issued, by){
+  const XCOLS = xcols();
+  const z = zulu(), tz = z ? "UTC" : tzAbbr(issued), o = OFs.o, rows = S.rows;
+  const it = new Date(issued), iss = `${dayLabel(issued, z).wd}, ${dayLabel(issued, z).dt} ${new Date(issued).getUTCFullYear()} at ${hhmm(issued, z)} ${tz}`;
+  const R = [], merges = [], heights = {};
+  const ncol = XCOLS.length, last = colName(ncol - 1);
+  R.push([{ v:`${EXPO ? s.point : s.name} ${productName(s)}`, s:1 }]); heights[0] = 22;
+  R.push([{ v:`Issued ${iss} by ${by}`, s:2 }]);
+  R.push([{ v:`Forecast point ${s.point} (${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}). Times are ${tz}. Probabilities are the chance of the event at any time in the period.`, s:2 }]);
+  R.push([{ v: EXPO ? `Valid ${dayLabel(rows[0].a, z).dt} ${hhmm(rows[0].a, z)} to ${dayLabel(rows[rows.length - 1].b, z).dt} ${hhmm(rows[rows.length - 1].b, z)} ${tz}. ${constraintSummary()}` : "Hourly to 24 h, 3-hour blocks to day 5, 6-hour blocks on days 6 and 7. In blocks, temperature is the daytime high or overnight low, winds are the block maximum.", s:2 }]);
+  R.push([]);
+  const G = [["Valid",0,2]]; PARAMS.forEach((p, j) => { const ci = j + 3, g = G[G.length - 1]; const lab = grpLabel(p.g).replace(" (%)", ""); if (g[0] === lab && g[2] === ci - 1) g[2] = ci; else G.push([lab, ci, ci]); });
+  const gr = new Array(ncol).fill(null).map(() => ({ v:"", s:3 }));
+  G.forEach(([n, a, b]) => { gr[a] = { v:n, s:3 }; if (b > a) merges.push(`${colName(a)}6:${colName(b)}6`); });
+  R.push(gr); heights[5] = 20;
+  const hd = XCOLS.map((k, ci) => { if (ci < 3) return { v: ci === 1 ? `Time (${tz})` : k, s:4 }; const p = P[k]; return { v: (p.k === "xhot" ? `>${hotOf(s)}°F` : p.k === "sev" ? "Damaging wind, hail, tornado" : p.l) + (p.s ? `\n${p.s}` : ""), s:4 }; });
+  R.push(hd); heights[6] = 30;
+  let lastDay = null;
+  rows.forEach((r, i) => {
+    const dk = dayKey(r.a, z), top = dk !== lastDay; lastDay = dk;
+    const st = (base) => top ? base + 4 : base;
+    const rowNo = 8 + i;
+    const L = dayLabel(r.a, z);
+    const row = [{ v: top ? `${L.wd.slice(0,3)} ${L.dt}` : "", s: st(8) }, { v: rowTime(r), s: st(5) }, { v: `${r.len} h`, s: st(5) }];
+    for (const k of XCOLS.slice(3)){
+      const p = P[k], v = o[k][i], sp = spanMap(k)[i];
+      if (sp.cov){ row.push({ v:"", s: st(5) }); continue; }
+      if (sp.s > 1){ const col = colName(XCOLS.indexOf(k)); merges.push(`${col}${rowNo}:${col}${rowNo + sp.s - 1}`); }
+      if (v === undefined){ row.push({ v:"-", s: st(5) }); continue; }
+      if (v === null){ row.push({ v:"", s: st(5) }); continue; }
+      if (p.kind === "prob") row.push({ v: Math.round(v)/100, s: st(7) });
+      else if (p.kind === "sky") row.push({ v: skyCat(v), s: st(5) });
+      else if (p.kind === "dir") row.push({ v: compass(v), s: st(5) });
+      else if (p.kind === "sev") row.push({ v: v === "-" ? "-" : SEV_NAME[v], s: st(5) });
+      else row.push({ v: Math.round(isWind(p) ? v*wfac() : v), s: st(6) });
+    }
+    R.push(row);
+  });
+  const n0 = 8, n1 = 7 + rows.length;
+  merges.push(`A1:${last}1`, `A2:${last}2`, `A3:${last}3`, `A4:${last}4`);
+  return { name: `${s.name} (${s.point})`.slice(0, 31), rows:R, merges, heights, freeze:{ r:7, c:3 },
+    cols:[11,11,7, ...PARAMS.map(p => p.kind === "sev" ? 14 : p.kind === "prob" ? 8 : 7)],
+    cf: PARAMS.map((p, j) => p.kind === "prob" ? `${colName(j + 3)}${n0}:${colName(j + 3)}${n1}` : null).filter(Boolean) };
+}
+function csvFor(list, issued, by, internal){
+  if (EXPO) return csvGeneric(list, issued, by, internal);
+  const head = ["site","point","valid_start_utc","valid_end_utc","valid_start_local","period_h","sky","sky_pct","temp_f","dewpoint_f","wbgt_f","pop_1h_pct","pop_3h_pct","pop_6h_pct","ltg_1h_pct","ltg_3h_pct","ltg_6h_pct","wind54_sust_kt","wind54_peak_kt","wind200_sust_kt","wind200_peak_kt","wind_dir_deg","wind_dir","p_sust_gt18kt_pct","p_peak_gt25kt_pct","p_peak_gt35kt_pct","p_peak_gt50kt_pct","p_temp_gt_hot_pct","hot_threshold_f","p_temp_lt40f_pct","p_temp_lt32f_pct","p_vis_lt3mi_pct","severe","issued_utc","forecaster"];
+  const q = v => { if (v === undefined || v === null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+  const lines = [head.join(",")];
+  for (const [s, OFs] of list){
+    const o = OFs.o;
+    S.rows.forEach((r, i) => {
+      const p = lp(r.a), loc = `${p.y}-${pad2(p.mo)}-${pad2(p.d)} ${pad2(p.h)}:00`;
+      const n = k => o[k][i] == null ? "" : Math.round(o[k][i]);
+      lines.push([s.name, s.point, new Date(r.a).toISOString().slice(0,16) + "Z", new Date(r.b).toISOString().slice(0,16) + "Z", loc, r.len, o.sky[i] == null ? "" : skyCat(o.sky[i]), n("sky"), n("t"), n("td"), n("wbgt"), n("pp1"), n("pp3"), n("pp6"), n("lt1"), n("lt3"), n("lt6"), n("s54"), n("g54"), n("s200"), n("g200"), n("dir"), o.dir[i] == null ? "" : compass(o.dir[i]), n("x18"), n("x25"), n("x35"), n("x50"), n("xhot"), hotOf(s), n("x40"), n("x32"), n("xvis"), o.sev[i] || "-", new Date(issued).toISOString().slice(0,16) + "Z", by].map(q).join(","));
+    });
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+/* exposure CSV: one column per parameter on the page */
+function csvGeneric(list, issued, by, internal){
+  const colOf = p => { const c = p.csv || (p.kind === "prob" ? `${p.k}_pct` : p.k); return isWind(p) ? c.replace(/_kt$/, "_" + wuLabel().replace("/", "p")) : c; };
+  /* guidance beside the official value for the constraints and winds, so verification can show what the edits added */
+  const GD = internal ? PARAMS.filter(p => p.cons || /^[sg]\d+$/.test(p.k)) : [];
+  const head = ["point","lat","lon","valid_start_utc","valid_end_utc","valid_start_local","period_h", ...PARAMS.map(colOf), "issued_utc","forecaster", ...GD.map(p => colOf(p) + "_guidance")];
+  const q = v => { if (v === undefined || v === null) return ""; const t = String(v); return /[",\n]/.test(t) ? `"${t.replace(/"/g, '""')}"` : t; };
+  const lines = [`# ${productName()}. ${constraintSummary()}`, head.join(",")];
+  for (const [s, OFs] of list){
+    const o = OFs.o;
+    S.rows.forEach((r, i) => {
+      const p = lp(r.a), loc = `${p.y}-${pad2(p.mo)}-${pad2(p.d)} ${pad2(p.h)}:00`;
+      const val = pp => { const v = o[pp.k][i]; if (v == null) return ""; if (pp.kind === "sky") return skyCat(v); if (pp.kind === "dir") return Math.round(v); if (pp.kind === "sev") return v; return Math.round(isWind(pp) ? v*wfac() : v); };
+      const gval = pp => { const v = OFs.g && OFs.g[pp.k] ? OFs.g[pp.k][i] : null; return v == null ? "" : Math.round(isWind(pp) ? v*wfac() : v); };
+      lines.push([s.point, s.lat.toFixed(4), s.lon.toFixed(4), new Date(r.a).toISOString().slice(0,16) + "Z", new Date(r.b).toISOString().slice(0,16) + "Z", loc, r.len, ...PARAMS.map(val), new Date(issued).toISOString().slice(0,16) + "Z", by, ...GD.map(gval)].map(q).join(","));
+    });
+  }
+  return lines.join("\r\n") + "\r\n";
+}
+function download(blob, name){ const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 1500); }
+function openPublish(){
+  const dlg = $("pubDlg");
+  $("pubSites").innerHTML = SITES.map(s => `<label><input type="checkbox" value="${s.id}" ${s.id === prefs.site || editCount(s.id) ? "checked" : ""}> ${s.name} <span style="color:var(--ink-3)">${s.point}</span></label>`).join("");
+  $("pubInit").value = prefs.initials || "";
+  const fm = prefs.fmt || { x:true, c:true, p:true, h:true };
+  $("fmtX").checked = fm.x; $("fmtC").checked = fm.c; $("fmtP").checked = fm.p; $("fmtH").checked = fm.h;
+  const qcRefresh = () => {
+    const ids = [...$("pubSites").querySelectorAll("input:checked")].map(x => x.value);
+    const msgs = [];
+    consistencyIssues(ids).forEach(it => msgs.push(`Consistency: ${consText(it)}`));
+    ids.forEach(id => { const q = qcIssues(id, officialFor(id)); q.list.forEach(it => msgs.push(`${SITES.find(s => s.id === id).name}, ${dayLabel(S.rows[it.i].a, zulu()).wd.slice(0,3)} ${rowTime(S.rows[it.i])}: ${it.msg}`)); });
+    const el = $("qc");
+    if (msgs.length){ el.className = "qc show"; el.innerHTML = `<b>${msgs.length} check${msgs.length > 1 ? "s" : ""} to look at.</b> You can still publish.<ul>${msgs.slice(0, 10).map(m => `<li>${m}</li>`).join("")}${msgs.length > 10 ? `<li>and ${msgs.length - 10} more</li>` : ""}</ul>`; }
+    else el.className = "qc";
+    $("pubGo").disabled = !ids.length;
+  };
+  $("pubSites").onchange = qcRefresh; qcRefresh();
+  dlg.showModal(); $("pubInit").focus();
+}
+async function doPublish(){
+  const logo = await loadLogo();
+  const ids = [...$("pubSites").querySelectorAll("input:checked")].map(x => x.value);
+  const by = ($("pubInit").value || "").trim().toUpperCase() || "WX";
+  prefs.initials = by; $("initials").value = by; savePrefs();
+  const issued = Date.now(), list = ids.map(id => [SITES.find(s => s.id === id), officialFor(id)]);
+  const p = lp(issued), stamp = `${p.y}${pad2(p.mo)}${pad2(p.d)}_${pad2(p.h)}${pad2(p.mi)}`;
+  const tag = ids.length === 1 ? "_" + SITES.find(s => s.id === ids[0]).point.replace(/[^A-Za-z0-9]/g, "") : "";
+  let nfiles = 0;
+  if ($("fmtX").checked){ download(workbook(list.map(([s, o]) => siteSheet(s, o, issued, by)), logo), `${FILE_BASE()}${tag}_${stamp}.xlsx`); nfiles++; }
+  if ($("fmtC").checked){ setTimeout(() => download(new Blob([csvFor(list, issued, by)], { type:"text/csv" }), `${FILE_BASE()}${tag}_${stamp}.csv`), 300); nfiles++; }
+  const wantP = $("fmtP").checked, wantH = $("fmtH").checked;
+  if (wantP || wantH){
+    const models = reportModel(list, issued, by);
+    if (wantP){ setTimeout(() => download(pdfReport(models, logo), `${FILE_BASE()}${tag}_${stamp}.pdf`), 600); nfiles++; }
+    if (wantH){ setTimeout(() => download(new Blob([interactiveReport(list, issued, by, logo)], { type:"text/html" }), `${FILE_BASE()}${tag}_${stamp}.html`), 900); nfiles++; }
+  }
+  keepForVerification(list, issued, by);
+  prefs.fmt = { x:$("fmtX").checked, c:$("fmtC").checked, p:wantP, h:wantH }; savePrefs();
+  ids.forEach(id => published[id] = { t: issued, by }); store.set(LS.pub, published);
+  renderStatus();
+  toast(`Published ${hhmm(issued, zulu())}${zulu() ? "Z" : ""}, ${nfiles} file${nfiles === 1 ? "" : "s"} downloaded`);
+}
+/* ============================================================
+   Publish: PDF and HTML forecast tables (time across, paged by day)
+   ============================================================ */
+const MIX = (rgb, a) => rgb.map(c => Math.round(255 - (255 - c)*a));
+function tintRGB(p, v){
+  if (v == null || v === undefined) return null;
+  if (p.kind === "prob"){ const a = Math.min(0.62, v/100*0.62); return a > 0.02 ? MIX([11,110,121], a) : null; }
+  if (p.k === "t" || p.k === "wbgt"){ if (v >= 85) return MIX([178,58,46], Math.min(0.32, (v - 84)/40)); if (v <= 50) return MIX([52,102,170], Math.min(0.3, (51 - v)/40)); return null; }
+  if (p.unit === "kt" && p.kind === "num"){ const a = Math.max(0, Math.min(0.4, (v - 12)/45)); return a > 0.02 ? MIX([178,58,46], a) : null; }
+  if (p.kind === "sky"){ const a = Math.max(0, v)/100*0.16; return a > 0.02 ? MIX([120,135,150], a) : null; }
+  if (p.kind === "sev" && v !== "-") return MIX([178,58,46], 0.08 + SEV.indexOf(v)*0.06);
+  return null;
+}
+const MAXCOLS = 30;
+/* one model per site: header text plus pages of whole days, each with merged cells clipped to the page */
+function reportModel(list, issued, by){
+  const z = zulu(), tz = z ? "UTC" : tzAbbr(issued), rows = S.rows;
+  const iss = `${dayLabel(issued, z).wd}, ${dayLabel(issued, z).dt} ${new Date(issued).getUTCFullYear()} at ${hhmm(issued, z)} ${tz}`;
+  const days = []; rows.forEach((r, i) => { const dk = dayKey(r.a, z); const d = days[days.length - 1]; if (d && d.dk === dk) d.cols.push(i); else days.push({ dk, cols:[i] }); });
+  const pages = []; let cur = null;
+  for (const d of days){ if (!cur || cur.cols.length + d.cols.length > MAXCOLS){ cur = { days:[], cols:[] }; pages.push(cur); } cur.days.push(d); cur.cols.push(...d.cols); }
+  /* fold a short last page (day 7 on its own) into the one before */
+  if (pages.length > 1){ const L = pages[pages.length - 1], P2 = pages[pages.length - 2]; if (L.cols.length <= 8 && P2.cols.length + L.cols.length <= 36){ P2.days.push(...L.days); P2.cols.push(...L.cols); pages.pop(); } }
+  const tlab = r => { const a = hhmm(r.a, z).slice(0, 2); return r.len === 1 ? a : `${a}–${hhmm(r.b, z).slice(0, 2)}`; };
+  return list.map(([s, OFs]) => {
+    const o = OFs.o;
+    return {
+      site:s, title: PERSONAL ? productName(s) : `${EXPO ? s.point : s.name} ${productName(s)}`,
+      sub: PERSONAL ? `${s.name} (${s.lat.toFixed(3)}, ${s.lon.toFixed(3)}). Issued ${iss}${by ? " by " + by : ""}. Times ${tz}.` : `Issued ${iss} by ${by}. Forecast point ${s.point} (${s.lat.toFixed(4)}, ${s.lon.toFixed(4)}). Times ${tz}.${EXPO ? " " + constraintSummary() : ""}`,
+      summary: PERSONAL ? persSummary() : null,
+      pages: pages.map(pg => {
+        const set = new Set(pg.cols);
+        const dayHdr = pg.days.map((d, j) => { const L = dayLabel(rows[d.cols[0]].a, z); const nm = d.dk === dayKey(issued, z) ? "Today" : d.dk === dayKey(issued + 24*H, z) ? "Tomorrow" : L.wd; return { label: d.cols.length >= 3 ? `${nm}, ${L.dt}` : L.dt, n:d.cols.length }; });
+        const times = pg.cols.map(i => ({ t:tlab(rows[i]), sub: rows[i].len > 1 ? rows[i].len + " h" : "", day: pg.days.some(d => d.cols[0] === i) }));
+        const groups = [];
+        for (const p of PARAMS){
+          let g = groups[groups.length - 1]; if (!g || g.g !== grpLabel(p.g)){ g = { g:grpLabel(p.g), rows:[] }; groups.push(g); }
+          const spm = spanMap(p.k), cells = [];
+          pg.cols.forEach((i, ci) => {
+            const sp = spm[i];
+            if (sp.cov && ci > 0) return;             /* inside a merged cell already drawn */
+            const own = sp.cov ? ownerIdx(p.k, i) : i;
+            const len = sp.cov ? spm[own].s - (i - own) : sp.s;
+            let n = 1; while (n < len && set.has(i + n)) n++;
+            const v = o[p.k][own];
+            const txt = v === undefined ? "–" : p.kind === "sev" ? (v === "-" ? "-" : v) : fmt(p, v);
+            cells.push({ text: txt, span:n, fill: v === undefined ? null : tintRGB(p, v), muted: v === undefined, day: times[ci].day });
+          });
+          g.rows.push({ label: p.kind === "sev" ? "SPC category" : colLabel(p, s), sub: p.s, cells });
+        }
+        return { dayHdr, times, groups };
+      }),
+    };
+  });
+}
+
+/* ---------- HTML ---------- */
+const hesc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+function htmlReport(models, issued, logo){
+  const css = `body{font:13px/1.35 "Segoe UI",Arial,sans-serif;color:#13202E;margin:24px;background:#fff}
+h1{font-size:20px;margin:0 0 4px}h1+p{margin:0 0 12px;color:#4B5A68;font-size:12px}
+section{margin-bottom:36px}table{border-collapse:collapse;margin:0 0 16px;font-variant-numeric:tabular-nums}
+th,td{border:1px solid #D4DBDF;padding:3px 4px;text-align:center;white-space:nowrap;font-size:12px}
+thead th{background:#F4F7F7;font-weight:600}th.grp{background:#F4F7F7;text-align:left;vertical-align:top;white-space:normal;width:110px}
+th.lab{text-align:left;font-weight:600;color:#4B5A68}th.lab small,thead small{color:#7D8B97;font-weight:400;display:block;font-size:10px}
+td.mut{color:#9AA6B0}.hd{display:flex;gap:14px;align-items:center;margin-bottom:12px}.hd img{height:64px;width:auto}.hd h1{margin:0 0 4px}.hd p{margin:0}.wrap{overflow-x:auto;margin-bottom:16px}.wrap table{margin:0}.d{border-left:2px solid #7D8B97}.note{color:#7D8B97;font-size:11px;max-width:110ch}
+@media print{body{margin:10mm}section{page-break-after:always}table{page-break-inside:avoid}}`;
+  let h = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${productName()}</title><style>${css}</style></head><body>`;
+  for (const m of models){
+    h += `<section><header class="hd">${logo ? `<img src="data:image/png;base64,${logo.b64}" alt="45th Weather Squadron">` : ""}<div><h1>${hesc(m.title)}</h1><p>${hesc(m.sub)}</p></div></header>`;
+    for (const pg of m.pages){
+      h += `<div class="wrap"><table><thead><tr><th colspan="2"></th>${pg.dayHdr.map(d => `<th colspan="${d.n}" class="d" style="text-align:left">${hesc(d.label)}</th>`).join("")}</tr>`;
+      h += `<tr><th colspan="2" style="text-align:left">Parameter</th>${pg.times.map(t => `<th class="${t.day ? "d" : ""}">${t.t}${t.sub ? `<small>${t.sub}</small>` : ""}</th>`).join("")}</tr></thead><tbody>`;
+      for (const g of pg.groups){
+        g.rows.forEach((r, j) => {
+          h += `<tr>${j === 0 ? `<th class="grp" rowspan="${g.rows.length}">${hesc(g.g)}</th>` : ""}<th class="lab">${hesc(r.label)}${r.sub ? ` <small style="display:inline">${hesc(r.sub)}</small>` : ""}</th>`;
+          h += r.cells.map(c => `<td${c.span > 1 ? ` colspan="${c.span}"` : ""} class="${c.day ? "d " : ""}${c.muted ? "mut" : ""}"${c.fill ? ` style="background:rgb(${c.fill.join(",")})"` : ""}>${hesc(c.text)}</td>`).join("") + `</tr>`;
+        });
+      }
+      h += `</tbody></table></div>`;
+    }
+    h += `</section>`;
+  }
+  h += `<p class="note">${hesc(document.querySelector(".foot p").textContent)}</p></body></html>`;
+  return h;
+}
+
+/* every published forecast is also kept in this browser for the Verification tab, with the guidance
+   beside the official values; the customer files carry neither */
+function keepForVerification(list, issued, by){
+  try {
+    const text = csvFor(list, issued, by, true), kind = BURN ? null : EXPO ? "exposure" : LMEF ? null : "planning"; if (!kind) return;
+    const q = indexedDB.open("erwx-verify", 1);
+    q.onupgradeneeded = () => q.result.createObjectStore("official");
+    q.onsuccess = () => {
+      const db = q.result, tx = db.transaction("official", "readwrite"), os = tx.objectStore("official"), g = os.get("published");
+      g.onsuccess = () => { const arr = (g.result || []).filter(x => Date.now() - x.t < 120*86400e3); arr.push({ kind, t:issued, name:`${FILE_BASE()}${issued}`, text }); os.put(arr, "published"); };
+    };
+  } catch (e) { /* storage unavailable; the CSV can still be loaded by hand */ }
+}
+/* ---------- interactive HTML product ----------
+   One self-contained page: the data as JSON plus a small viewer (reportViewer below, embedded as
+   source). Sites as tabs, a continuous scrollable table with sticky headers, time across or down,
+   local or UTC, wind units, parameter filters, day jumps, graphs with hover readouts, light/dark and a
+   print layout. It shows the forecast only: nothing about guidance or the forecaster's edits. */
+function tintA(p, v){
+  if (v == null) return null;
+  if (p.kind === "prob"){ const a = Math.min(0.62, v/100*0.62); return a > 0.02 ? [11,110,121,a] : null; }
+  if (p.k === "t" || p.k === "wbgt"){ if (v >= 85) return [178,58,46,Math.min(0.32, (v - 84)/40)]; if (v <= 50) return [52,102,170,Math.min(0.3, (51 - v)/40)]; return null; }
+  if (p.unit === "kt" && p.kind === "num"){ const a = Math.max(0, Math.min(0.4, (v - 12)/45)); return a > 0.02 ? [178,58,46,a] : null; }
+  if (p.kind === "sky"){ const a = Math.max(0, v)/100*0.16; return a > 0.02 ? [120,135,150,a] : null; }
+  if (p.kind === "sev" && v !== "-") return [178,58,46,0.08 + SEV.indexOf(v)*0.06];
+  return null;
+}
+/* the customer-facing explanation of the table (the editor's footnote is for forecasters) */
+function productNote(){
+  if (PERSONAL) return "Times are local to the forecast point. Chances are the chance of the event at any time in the row. Winds and gusts are at the standard 10 m height.";
+  if (BURN) return "Rows are hourly. Prescription rows give the chance each criterion, and all of them together, is met through the hour. Mixing height is above ground; transport wind is the mean wind through the mixed layer; ventilation is mixing height × transport wind. LDSI is the Lavdas dispersion index and LVORI the MFL table from humidity and LDSI; Haines is the low-elevation form. Winds are in the selected unit; temperatures in °F.";
+  const blocks = EXPO ? `Rows are hourly for the first ${prefs.exp && prefs.exp.hourly != null ? prefs.exp.hourly : 24} hours, then 3-hour blocks to the end of the period.` : "Rows are hourly for the first 24 hours, then 3-hour blocks through day 5 and 6-hour blocks on days 6 and 7.";
+  return `${blocks} In blocks, temperature shows the warmest value for daytime blocks and the coolest for overnight blocks, winds show the block maximum, and probabilities are the chance of the event at any time in the period shown. 3 hr and 6 hr probabilities cover the 3 or 6 hours starting at that time.${EXPO ? " Constraint probabilities are the chance that the constraint is met at any time in the row." : ""} Winds are in the selected unit; temperatures in °F.`;
+}
+function interactiveReport(list, issued, by, logo){
+  const rows = S.rows.map(r => ({ a:r.a, b:r.b, len:r.len }));
+  const r2 = v => v == null ? null : Math.round(v*10)/10;
+  const data = {
+    product: productName(list[0] && list[0][0]), issued, by, tz:TZ, units:wuLabel(), expo:!!EXPO,
+    constraints: EXPO ? constraintSummary() : "", note: productNote(), summary: PERSONAL ? persSummary() : null,
+    logo: logo ? `data:image/png;base64,${logo.b64}` : null, rows,
+    sites: list.map(([st, OFs]) => ({
+      id:st.id, name: EXPO ? st.point : st.name, point:st.point, lat:st.lat, lon:st.lon,
+      params: PARAMS.map(p => {
+        const spm = spanMap(p.k);
+        return { k:p.k, label: p.kind === "sev" ? "SPC category" : colLabel(p, st), sub:p.s || "", group:p.g, kind:p.kind, wind:isWind(p), unit:p.unit || "", thr:p.thr || [], cons:!!p.cons, limit: p.cons ? p.v : null,
+          cells: rows.map((r, i) => {
+            const sp = spm[i]; if (sp.cov) return 0;
+            const v = OFs.o[p.k][i];
+            if (v === undefined) return [sp.s, null, "–", null];
+            const txt = p.kind === "sev" ? (v === "-" ? "-" : v) : p.kind === "sky" ? skyCat(v) : p.kind === "dir" ? (v == null ? "" : compass(v)) : null;
+            return [sp.s, typeof v === "number" ? r2(v) : v, txt, tintA(p, v)];
+          }) };
+      }) })),
+  };
+  const json = JSON.stringify(data).replace(/</g, "\\u003c");
+  const css = `:root{--bg:#F4F6F7;--panel:#fff;--ink:#13202E;--ink2:#4B5A68;--ink3:#7D8B97;--rule:#D4DBDF;--rule2:#E7ECEE;--acc:#0E7C86;--ed:#B5862B;--fa:1;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#0E141B;--panel:#151D26;--ink:#E7EDF2;--ink2:#A9B6C2;--ink3:#7F8D99;--rule:#2A3643;--rule2:#1F2933;--acc:#46B3BC;--ed:#E0B25A;--fa:.55;color-scheme:dark}}
+:root[data-theme=dark]{--bg:#0E141B;--panel:#151D26;--ink:#E7EDF2;--ink2:#A9B6C2;--ink3:#7F8D99;--rule:#2A3643;--rule2:#1F2933;--acc:#46B3BC;--ed:#E0B25A;--fa:.55;color-scheme:dark}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.4 "Segoe UI",system-ui,-apple-system,Arial,sans-serif}
+header.top{display:flex;gap:16px;align-items:center;padding:16px 22px;background:var(--panel);border-bottom:1px solid var(--rule)}header.top img{height:64px;width:auto}
+header.top h1{margin:0;font-size:22px}header.top p{margin:3px 0 0;color:var(--ink2);font-size:13px}
+.bar{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;padding:10px 22px;background:var(--panel);border-bottom:1px solid var(--rule);box-shadow:0 2px 6px rgba(0,0,0,.04)}
+.seg{display:inline-flex;border:1px solid var(--rule);border-radius:8px;overflow:hidden}.seg button{border:0;background:none;color:var(--ink2);padding:6px 11px;font:600 13px inherit;cursor:pointer}.seg button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
+select,.btn{border:1px solid var(--rule);border-radius:8px;background:var(--panel);color:var(--ink);padding:6px 10px;font:13px inherit;cursor:pointer}
+.chips{display:flex;flex-wrap:wrap;gap:5px}.chip{border:1px solid var(--rule);border-radius:999px;background:none;color:var(--ink2);padding:4px 10px;font:600 12px inherit;cursor:pointer}.chip[aria-pressed=true]{background:var(--acc);border-color:var(--acc);color:#fff}
+.sp{flex:1}.lab{font-size:12px;color:var(--ink3)}
+.tabs{display:flex;gap:4px;padding:12px 22px 0;flex-wrap:wrap}.tabs button{border:1px solid var(--rule);border-bottom:0;border-radius:10px 10px 0 0;background:var(--rule2);color:var(--ink2);padding:8px 14px;font:600 14px inherit;cursor:pointer}.tabs button[aria-selected=true]{background:var(--panel);color:var(--ink)}
+main{padding:0 22px 30px}.card{background:var(--panel);border:1px solid var(--rule);border-radius:0 12px 12px 12px;padding:14px}
+.meta{color:var(--ink2);font-size:13px;margin:0 0 10px}.psum{border:1px solid var(--rule,#ddd);border-radius:10px;padding:10px 14px;margin:0 0 12px}.psum h3{margin:4px 0;font-size:14px}.psum ul{margin:2px 0 6px 18px;padding:0}.psum p{margin:2px 0 4px;line-height:1.45}.cons{background:rgba(181,134,43,.12);border-radius:8px;padding:8px 12px;margin:0 0 10px;font-size:13px}
+.days{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+.tw{overflow:auto;max-height:calc(100vh - 210px);border:1px solid var(--rule);border-radius:10px}
+table{border-collapse:separate;border-spacing:0;font-variant-numeric:tabular-nums;font-size:12.5px}
+th,td{border-right:1px solid var(--rule2);border-bottom:1px solid var(--rule2);padding:4px 6px;text-align:center;white-space:nowrap;background:var(--panel)}
+thead th{position:sticky;top:0;z-index:3;background:var(--panel);font-weight:600;color:var(--ink2)}thead tr:nth-child(2) th{top:27px}
+th.g{position:sticky;left:0;z-index:2;text-align:left;vertical-align:top;color:var(--ink2);font-size:12px;min-width:110px;max-width:130px;white-space:normal}
+th.l{position:sticky;left:110px;z-index:2;text-align:left;min-width:120px}th.l small,thead small{display:block;font-weight:400;color:var(--ink3);font-size:10.5px}
+thead th.c0{left:0;z-index:4;position:sticky}thead th.c1{left:110px;z-index:4;position:sticky}
+td{position:relative;cursor:default}td.na{color:var(--ink3)}.dstart{border-left:2px solid var(--ink3)!important}
+tr.cons th.l{color:var(--ed)}tbody tr:hover td,tbody tr:hover th.l{box-shadow:inset 0 0 0 999px rgba(14,124,134,.06)}td.hc{box-shadow:inset 0 0 0 999px rgba(14,124,134,.08)}
+table.down th.t{position:sticky;left:0;z-index:2;text-align:left}table.down tr.day th{position:sticky;left:0;text-align:left;background:var(--rule2);color:var(--ink)}
+.tip{position:fixed;z-index:50;pointer-events:none;background:var(--ink);color:var(--panel);border-radius:8px;padding:7px 10px;font-size:12px;line-height:1.45;box-shadow:0 6px 18px rgba(0,0,0,.2);display:none;max-width:280px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(420px,1fr));gap:12px}.gc{border:1px solid var(--rule2);border-radius:10px;padding:10px 12px}.gc h3{margin:0 0 2px;font-size:14px}.gc h3 small{color:var(--ink3);font-weight:400}
+.gc svg{width:100%;height:auto;display:block}.gc .ax{font-size:10.5px;fill:var(--ink3)}.gc .gr{stroke:var(--rule2)}.gc .ln{fill:none;stroke:var(--acc);stroke-width:2}.gc .gd{fill:none;stroke:var(--ink3);stroke-width:1.4;stroke-dasharray:4 3}.gc .bar2{fill:var(--acc);opacity:.75}.gc .thr{stroke:#B23A2E;stroke-dasharray:3 3}.gc .ed{fill:var(--ed)}.gc .hv{stroke:var(--ink3);stroke-width:1}
+footer{color:var(--ink3);font-size:12px;padding:14px 22px 30px}
+@media print{.bar,.tabs,.days,.tip{display:none!important}.tw{max-height:none;overflow:visible;border:0}thead th,th.g,th.l{position:static}body{background:#fff}.card{border:0;padding:0}.site{display:block!important;page-break-after:always}}`;
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${hesc(data.product)}</title><style>${css}</style></head><body>
+<header class="top">${data.logo ? `<img src="${data.logo}" alt="45th Weather Squadron">` : ""}<div><h1>${hesc(data.product)}</h1><p id="hsub"></p></div></header>
+<div class="bar" role="toolbar" aria-label="View options">
+<span class="seg" id="vw"><button data-v="table" aria-pressed="true">Table</button><button data-v="graphs" aria-pressed="false">Graphs</button></span>
+<span class="seg" id="orient"><button data-o="across" aria-pressed="true">Time across</button><button data-o="down" aria-pressed="false">Time down</button></span>
+<span class="seg" id="tzs"><button data-z="L" aria-pressed="true">Local</button><button data-z="Z" aria-pressed="false">UTC</button></span>
+<label class="lab">Wind <select id="wu"><option>kt</option><option>mph</option><option>m/s</option><option>ft/s</option><option>km/h</option></select></label>
+<span class="sp"></span>
+<span class="seg" id="th"><button data-t="auto" aria-pressed="true">Auto</button><button data-t="light" aria-pressed="false">Light</button><button data-t="dark" aria-pressed="false">Dark</button></span>
+<button class="btn" id="pr">Print</button>
+<div class="chips" id="grps" style="flex-basis:100%"></div>
+</div>
+<div class="tabs" id="tabs" role="tablist"></div>
+<main><div class="card" id="card"></div></main>
+<footer id="foot"></footer><div class="tip" id="tip"></div>
+<script type="application/json" id="data">${json}</script>
+<script>(${reportViewer.toString()})();</script></body></html>`;
+}
+/* the viewer that runs inside the exported page (it is embedded as source, never run here) */
+function reportViewer(){
+  const D = JSON.parse(document.getElementById("data").textContent);
+  const $ = id => document.getElementById(id), H = 3600e3;
+  const UF = { kt:1, mph:1/0.868976, "m/s":1/1.943844, "ft/s":1/0.592484, "km/h":1/0.539957 };
+  const st = { site:0, view:"table", orient:"across", z:"L", wu:D.units, groups:null };
+  try { Object.assign(st, JSON.parse(localStorage.getItem("erwx:product") || "{}")); } catch (e) { /* ignore */ }
+  if (st.site >= D.sites.length) st.site = 0;
+  const esc = s => String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const save = () => { try { const { site, view, orient, z, wu } = st; localStorage.setItem("erwx:product", JSON.stringify({ site, view, orient, z, wu })); } catch (e) { /* ignore */ } };
+  const fmtL = new Intl.DateTimeFormat("en-US", { timeZone:D.tz, hour:"2-digit", minute:"2-digit", hourCycle:"h23" });
+  const dayL = new Intl.DateTimeFormat("en-US", { timeZone:D.tz, weekday:"short", month:"short", day:"numeric" });
+  const dayZ = new Intl.DateTimeFormat("en-US", { timeZone:"UTC", weekday:"short", month:"short", day:"numeric" });
+  const keyL = new Intl.DateTimeFormat("en-CA", { timeZone:D.tz, year:"numeric", month:"2-digit", day:"2-digit" });
+  const hm = t => st.z === "Z" ? new Date(t).toISOString().slice(11, 16).replace(":", "") : fmtL.format(new Date(t)).replace(":", "");
+  const dk = t => st.z === "Z" ? new Date(t).toISOString().slice(0, 10) : keyL.format(new Date(t));
+  const dl = t => (st.z === "Z" ? dayZ : dayL).format(new Date(t));
+  const tzName = () => st.z === "Z" ? "UTC" : (new Intl.DateTimeFormat("en-US", { timeZone:D.tz, timeZoneName:"short" }).format(new Date(D.issued)).split(" ").pop());
+  const groupName = g => g.replace("Winds (kt)", "Winds (" + st.wu + ")");
+  const valTxt = (p, c) => { if (!c || c[1] == null) return c && c[2] != null ? c[2] : ""; if (c[2] != null) return c[2]; if (p.wind) return String(Math.round(c[1]*UF[st.wu])); return String(Math.round(c[1])); };
+  const unitOf = p => p.wind ? st.wu : p.kind === "prob" ? "%" : p.unit === "°F" || p.k === "t" || p.k === "td" || p.k === "wbgt" ? "°F" : p.unit || "";
+  const bg = c => c && c[3] ? ` style="background:rgba(${c[3][0]},${c[3][1]},${c[3][2]},calc(${c[3][3].toFixed(3)} / var(--fa)))"` : "";
+  const site = () => D.sites[st.site];
+  const groups = () => [...new Set(site().params.map(p => p.group))];
+  if (!st.groups) st.groups = Object.fromEntries(groups().map(g => [g, true]));
+  const theme = t => { if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t); document.querySelectorAll("#th button").forEach(b => b.setAttribute("aria-pressed", b.dataset.t === t)); try { localStorage.setItem("erwx:theme", t); } catch (e) { /* ignore */ } };
+  let th0 = "auto"; try { th0 = localStorage.getItem("erwx:theme") || "auto"; } catch (e) { /* ignore */ } theme(th0);
+  function head(){
+    const iso = new Date(D.issued);
+    $("hsub").textContent = `Issued ${dl(D.issued)} ${iso.getUTCFullYear()} at ${hm(D.issued)} ${tzName()}${D.by ? " by " + D.by : ""}. ${D.sites.length > 1 ? D.sites.length + " forecast points." : ""}`;
+    $("tabs").innerHTML = D.sites.length > 1 ? D.sites.map((s, i) => `<button role="tab" aria-selected="${i === st.site}" data-s="${i}">${esc(s.name)}</button>`).join("") : "";
+    $("grps").innerHTML = groups().map(g => `<button class="chip" data-g="${esc(g)}" aria-pressed="${st.groups[g] !== false}">${esc(groupName(g))}</button>`).join("");
+    ["vw","orient","tzs"].forEach(id => document.querySelectorAll(`#${id} button`).forEach(b => b.setAttribute("aria-pressed", (b.dataset.v || b.dataset.o || b.dataset.z) === (id === "vw" ? st.view : id === "orient" ? st.orient : st.z))));
+    $("wu").value = st.wu; $("orient").style.display = st.view === "table" ? "" : "none";
+    $("foot").textContent = D.note;
+  }
+  const visible = () => site().params.filter(p => st.groups[p.group] !== false);
+  function dayStarts(){ const out = []; let last = null; D.rows.forEach((r, i) => { const k = dk(r.a); if (k !== last){ out.push({ i, k, label: dl(r.a) }); last = k; } }); return out; }
+  function tableAcross(){
+    const days = dayStarts(), starts = new Set(days.map(d => d.i)), ps = visible();
+    let h = `<table class="across"><thead><tr><th class="c0" colspan="2"></th>`;
+    days.forEach((d, j) => { const n = (days[j + 1] ? days[j + 1].i : D.rows.length) - d.i; h += `<th colspan="${n}" class="dstart" id="day${j}" style="text-align:left">${esc(d.label)}</th>`; });
+    h += `</tr><tr><th class="c0" style="text-align:left">Group</th><th class="c1" style="text-align:left">Parameter</th>` + D.rows.map((r, i) => `<th class="${starts.has(i) ? "dstart" : ""}" data-ci="${i}">${hm(r.a).slice(0, 2)}${r.len > 1 ? "–" + hm(r.b).slice(0, 2) : ""}${r.len > 1 ? `<small>${r.len} h</small>` : ""}</th>`).join("") + `</tr></thead><tbody>`;
+    let lastG = null;
+    ps.forEach((p, pi) => {
+      const n = ps.filter(q => q.group === p.group).length;
+      h += `<tr class="${p.cons ? "cons" : ""}">` + (p.group !== lastG ? `<th class="g" rowspan="${n}">${esc(groupName(p.group))}</th>` : "") + `<th class="l">${esc(p.label)}${p.sub ? `<small>${esc(p.sub)}</small>` : ""}</th>`;
+      lastG = p.group;
+      p.cells.forEach((c, i) => { if (!c) return; h += `<td colspan="${c[0]}" data-p="${pi}" data-i="${i}" class="${starts.has(i) ? "dstart " : ""}${c[1] == null && c[2] === "–" ? "na" : ""}"${bg(c)}>${esc(valTxt(p, c))}</td>`; });
+      h += `</tr>`;
+    });
+    return h + `</tbody></table>`;
+  }
+  function tableDown(){
+    const ps = visible(), days = dayStarts(), starts = new Map(days.map((d, j) => [d.i, j]));
+    let h = `<table class="down"><thead><tr><th class="t" rowspan="2" style="left:0;z-index:4">Time (${tzName()})</th>`;
+    const gs = []; ps.forEach(p => { const l = gs[gs.length - 1]; if (l && l.g === p.group) l.n++; else gs.push({ g:p.group, n:1 }); });
+    h += gs.map(g => `<th colspan="${g.n}">${esc(groupName(g.g))}</th>`).join("") + `</tr><tr>` + ps.map(p => `<th>${esc(p.label)}${p.sub ? `<small>${esc(p.sub)}</small>` : ""}</th>`).join("") + `</tr></thead><tbody>`;
+    const cover = ps.map(() => 0);
+    D.rows.forEach((r, i) => {
+      if (starts.has(i)) h += `<tr class="day" id="day${starts.get(i)}"><th colspan="${ps.length + 1}">${esc(days[starts.get(i)].label)}</th></tr>`;
+      h += `<tr><th class="t">${hm(r.a)}${r.len > 1 ? "–" + hm(r.b) : ""}</th>`;
+      ps.forEach((p, pi) => { const c = p.cells[i]; if (!c) return; h += `<td rowspan="${c[0]}" data-p="${pi}" data-i="${i}" class="${c[1] == null && c[2] === "–" ? "na" : ""}"${bg(c)}>${esc(valTxt(p, c))}</td>`; });
+      h += `</tr>`;
+    });
+    return h + `</tbody></table>`;
+  }
+  function graphs(){
+    const ps = visible().filter(p => p.kind !== "sev");
+    const t0 = D.rows[0].a, t1 = D.rows[D.rows.length - 1].b, W = 520, Hh = 150, L = 36, R = 10, T = 10, B = 22;
+    const x = t => L + (t - t0)/(t1 - t0)*(W - L - R);
+    const days = dayStarts();
+    return `<div class="grid">` + ps.map((p, pi) => {
+      const pts = [];
+      p.cells.forEach((c, i) => { if (c && c[1] != null && typeof c[1] === "number") pts.push({ i, a:D.rows[i].a, b:D.rows[Math.min(D.rows.length - 1, i + c[0] - 1)].b, v:c[1] }); });
+      if (!pts.length) return "";
+      const f = p.wind ? UF[st.wu] : 1, prob = p.kind === "prob" || p.kind === "sky";
+      const vals = pts.map(q => q.v*f);
+      const vmax = Math.max(...vals), thr = p.wind ? p.thr.map(v => v*f).filter(v => v <= vmax*1.35) : [];
+      let lo = prob ? 0 : Math.min(...vals), hi = prob ? 100 : Math.max(vmax, ...thr);
+      if (!prob){ const pad = Math.max(1, (hi - lo)*0.1); lo = Math.floor(lo - pad); hi = Math.ceil(hi + pad); if (p.kind === "dir"){ lo = 0; hi = 360; } }
+      const y = v => T + (1 - (v - lo)/(hi - lo || 1))*(Hh - T - B);
+      let s = `<svg viewBox="0 0 ${W} ${Hh}" data-p="${pi}">`;
+      for (let k = 0; k <= 2; k++){ const v = lo + (hi - lo)*k/2; s += `<line class="gr" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="ax" x="${L - 4}" y="${y(v) + 3}" text-anchor="end">${Math.round(v)}</text>`; }
+      days.forEach(d => { const xx = x(D.rows[d.i].a); s += `<line class="gr" x1="${xx}" x2="${xx}" y1="${T}" y2="${Hh - B}"/><text class="ax" x="${xx + 3}" y="${Hh - 6}">${esc(d.label.split(",")[0])}</text>`; });
+      if (p.kind === "prob") pts.forEach(q => { s += `<rect class="bar2" x="${x(q.a) + 0.5}" y="${y(q.v)}" width="${Math.max(1, x(q.b) - x(q.a) - 1)}" height="${y(0) - y(q.v)}"/>`; });
+      else { let d = ""; pts.forEach((q, j) => { d += `${j ? "L" : "M"}${x(q.a).toFixed(1)},${y(q.v*f).toFixed(1)}L${x(q.b).toFixed(1)},${y(q.v*f).toFixed(1)}`; }); s += `<path class="ln" d="${d}"/>`; }
+      if (p.wind) p.thr.forEach(v => { if (v*f >= lo && v*f <= hi) s += `<line class="thr" x1="${L}" x2="${W - R}" y1="${y(v*f)}" y2="${y(v*f)}"/>`; });
+      s += `<line class="hv" x1="0" x2="0" y1="${T}" y2="${Hh - B}" style="display:none"/></svg>`;
+      const gname = groupName(p.group).replace(/ \(.*\)$/, "");
+      const title = /^\d+ (hr|ft)$/.test(p.label) || p.kind === "prob" ? `${gname}: ${p.label}` : p.label;
+      return `<div class="gc"><h3>${esc(title)} <small>${esc(p.sub)}${p.kind === "sky" || p.kind === "dir" ? "" : " · " + esc(unitOf(p))}</small></h3>${s}</div>`;
+    }).join("") + `</div><p class="meta">${visible().some(p => p.wind && p.thr.length) ? "Red dashed lines: wind thresholds. " : ""}Hover a graph for values.</p>`;
+  }
+  function render(){
+    head();
+    const s = site(), days = dayStarts();
+    const body = st.view === "graphs" ? graphs() : `<div class="tw" id="tw">${st.orient === "down" ? tableDown() : tableAcross()}</div>`;
+    $("card").innerHTML = `<p class="meta">${esc(s.name)}${s.point && s.point !== s.name ? " (" + esc(s.point) + ")" : ""} · ${s.lat.toFixed(4)}, ${s.lon.toFixed(4)} · times ${tzName()}</p>${D.constraints ? `<p class="cons">${esc(D.constraints)}</p>` : ""}${D.summary ? `<div class="psum">${(D.summary.concerns || []).length ? `<h3>Main concerns</h3><ul>${D.summary.concerns.map(c => `<li>${esc(c)}</li>`).join("")}</ul>` : ""}${D.summary.text ? `<h3>Discussion</h3><p>${esc(D.summary.text)}</p>` : ""}</div>` : ""}${st.view === "table" ? `<div class="days">${days.map((d, j) => `<button class="btn" data-day="${j}">${esc(d.label)}</button>`).join("")}</div>` : ""}${body}`;
+    save();
+  }
+  /* hover readout */
+  const tip = $("tip");
+  function showTip(e, html){ tip.innerHTML = html; tip.style.display = "block"; const w = tip.offsetWidth, h = tip.offsetHeight; tip.style.left = Math.min(innerWidth - w - 8, e.clientX + 14) + "px"; tip.style.top = Math.min(innerHeight - h - 8, e.clientY + 14) + "px"; }
+  document.addEventListener("mousemove", e => {
+    const td = e.target.closest && e.target.closest("td[data-p]");
+    document.querySelectorAll("td.hc").forEach(x => x.classList.remove("hc"));
+    if (td){
+      const p = visible()[+td.dataset.p], i = +td.dataset.i, c = p.cells[i], r = D.rows[i], end = D.rows[Math.min(D.rows.length - 1, i + c[0] - 1)].b;
+      if (st.orient === "across") document.querySelectorAll(`td[data-i="${i}"]`).forEach(x => x.classList.add("hc"));
+      showTip(e, `<b>${esc(p.label)}</b>${p.sub ? " " + esc(p.sub) : ""}<br>${esc(dl(r.a))} ${hm(r.a)}–${hm(end)} ${tzName()}<br>Forecast: <b>${esc(valTxt(p, c) || "–")}${valTxt(p, c) && unitOf(p) && p.kind !== "sky" && p.kind !== "dir" ? " " + esc(unitOf(p)) : ""}</b>`);
+      return;
+    }
+    const sv = e.target.closest && e.target.closest("svg[data-p]");
+    if (sv){
+      const p = visible().filter(q => q.kind !== "sev")[+sv.dataset.p]; const box = sv.getBoundingClientRect(), W = 520, L = 36, R = 10;
+      const xr = (e.clientX - box.left)/box.width*W; const t0 = D.rows[0].a, t1 = D.rows[D.rows.length - 1].b, t = t0 + (xr - L)/(W - L - R)*(t1 - t0);
+      let i = D.rows.findIndex(r => t >= r.a && t < r.b); if (i < 0){ tip.style.display = "none"; return; }
+      let oi = i; while (oi > 0 && !p.cells[oi]) oi--; const c = p.cells[oi];
+      const hv = sv.querySelector(".hv"); hv.style.display = ""; hv.setAttribute("x1", xr); hv.setAttribute("x2", xr);
+      showTip(e, `<b>${esc(p.label)}</b> ${esc(dl(D.rows[i].a))} ${hm(D.rows[i].a)} ${tzName()}<br>Forecast: <b>${esc(valTxt(p, c) || "–")}${p.kind === "sky" || p.kind === "dir" ? "" : " " + esc(unitOf(p))}</b>`);
+      return;
+    }
+    document.querySelectorAll("svg .hv").forEach(h => h.style.display = "none");
+    tip.style.display = "none";
+  });
+  document.addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    if (b.dataset.s != null){ st.site = +b.dataset.s; render(); }
+    else if (b.dataset.v){ st.view = b.dataset.v; render(); }
+    else if (b.dataset.o){ st.orient = b.dataset.o; render(); }
+    else if (b.dataset.z){ st.z = b.dataset.z; render(); }
+    else if (b.dataset.t){ theme(b.dataset.t); }
+    else if (b.dataset.g != null){ st.groups[b.dataset.g] = st.groups[b.dataset.g] === false; render(); }
+    else if (b.dataset.day != null){ const el = document.getElementById("day" + b.dataset.day), tw = $("tw"); if (el && tw){ if (st.orient === "across") tw.scrollTo({ left: el.offsetLeft - 230, behavior:"smooth" }); else tw.scrollTo({ top: el.offsetTop - 60, behavior:"smooth" }); } }
+    else if (b.id === "pr"){ window.print(); }
+  });
+  $("wu").onchange = e => { st.wu = e.target.value; render(); };
+  render();
+}
+
+/* ---------- PDF (hand-built, Helvetica, US Letter landscape) ---------- */
+function pdfReport(models, logo){
+  const W = 792, Hp = 612, M = 28, ops = [];
+  const LH = logo ? 46 : 0, LW = logo ? LH*logo.rw/logo.rh : 0, TX = logo ? M + LW + 10 : M;
+  const pages = [];
+  let cs = [];
+  const f = n => (+n).toFixed(2);
+  const rgb = c => c.map(x => f(x/255)).join(" ");
+  const rect = (x, y, w, h, fill) => cs.push(`${rgb(fill)} rg ${f(x)} ${f(Hp - y - h)} ${f(w)} ${f(h)} re f`);
+  const line = (x1, y1, x2, y2, gray, wd) => cs.push(`${f(gray)} G ${f(wd)} w ${f(x1)} ${f(Hp - y1)} m ${f(x2)} ${f(Hp - y2)} l S`);
+  /* measure the text exactly as the PDF prints it (≥ and ≤ print as two characters) */
+  const plain = s => String(s).replace(/≥/g, ">=").replace(/≤/g, "<=");
+  const tw = (s, size, bold) => textW(plain(s), size, bold);
+  const text = (s, x, y, size, opt = {}) => {
+    s = plain(s);
+    const w = textW(s, size, opt.bold); let tx = x;
+    if (opt.align === "c") tx = x - w/2; else if (opt.align === "r") tx = x - w;
+    cs.push(`BT ${opt.color ? rgb(opt.color) + " rg " : "0.075 0.125 0.18 rg "}/${opt.bold ? "F2" : "F1"} ${f(size)} Tf ${f(tx)} ${f(Hp - y)} Td ${pdfStr(s)} Tj ET`);
+  };
+  const fitText = (s, maxW, size, bold) => { let z = size; while (z > 4.5 && tw(s, z, bold) > maxW) z -= 0.25; return z; };
+  /* row-header widths sized to this product's own labels, so nothing is cut off */
+  const headerWidths = m => {
+    let lw = 62, gw = 66;
+    for (const pg of m.pages) for (const g of pg.groups){
+      for (const r of g.rows) lw = Math.max(lw, tw(r.label, 6.8, true) + (r.sub ? 2 + tw(r.sub, 5.6, false) : 0) + 8);
+      const longest = Math.max(...g.g.split(" ").map(w => tw(w, 6.8, true))); gw = Math.max(gw, longest + 12);
+      /* wide enough that the wrapped name fits the group's rows */
+      const fits = w => { let ln = "", n = 1; for (const x of g.g.split(" ")){ const t2 = ln ? ln + " " + x : x; if (tw(t2, 6.8, true) > w - 10 && ln){ n++; ln = x; } else ln = t2; } return 9 + (n - 1)*8 + 3 <= g.rows.length*13.2; };
+      while (gw < 130 && !fits(gw)) gw += 4;
+    }
+    return { gw: Math.min(130, Math.ceil(gw)), lw: Math.min(170, Math.ceil(lw)) };
+  };
+  for (const m of models){
+    m.pages.forEach((pg, pi) => {
+      cs = [];
+      if (logo) cs.push(`q ${f(LW)} 0 0 ${f(LH)} ${f(M)} ${f(Hp - M + 4 - LH)} cm /Im1 Do Q`);
+      const ty = logo ? M + 14 : M + 12;
+      text(m.title, TX, ty, fitText(m.title, W - M - TX - 60, 13, true), { bold:true });
+      { /* long subtitles (a burn prescription, many constraints) wrap onto up to three lines */
+        const words = String(m.sub).split(" "), lines = []; let ln = "";
+        for (const w of words){ const t2 = ln ? ln + " " + w : w; if (tw(t2, 7.5, false) > W - M - TX && ln){ lines.push(ln); ln = w; } else ln = t2; }
+        if (ln) lines.push(ln);
+        const keep = lines.slice(0, 3); if (lines.length > 3) keep[2] = lines.slice(2).join(" ");
+        keep.forEach((l2, k) => text(l2, TX, ty + 13 + k*9, k === 2 ? fitText(l2, W - M - TX, 7.5, false) : 7.5, { color:[75,90,104] })); }
+      if (m.pages.length > 1) text(`Page ${pi + 1} of ${m.pages.length}`, W - M, M + 12, 7.5, { align:"r", color:[125,139,151] });
+      const { gw, lw } = m._hw || (m._hw = headerWidths(m)), x0 = M + gw + lw, ncol = pg.times.length;
+      let top = M + Math.max(38, LH + 4);
+      /* personal page: main concerns and discussion above the table on the first page */
+      if (m.summary && pi === 0){
+        const bw = W - 2*M, wrapT = (t, size, bold, wmax) => { const out = []; let ln = ""; for (const w of String(t || "").split(/\s+/).filter(Boolean)){ const t2 = ln ? ln + " " + w : w; if (tw(t2, size, bold) > wmax && ln){ out.push(ln); ln = w; } else ln = t2; } if (ln) out.push(ln); return out; };
+        const cl = (m.summary.concerns || []).slice(0, 6), dl = wrapT(m.summary.text, 8, false, bw - 16).slice(0, 8);
+        const bh = 16 + (cl.length ? 11 + cl.length*10 : 0) + (dl.length ? 6 + dl.length*10 : 0) + 4;
+        rect(M, top, bw, bh, [244,247,247]);
+        let yy = top + 12;
+        if (cl.length){ text("Main concerns", M + 8, yy, 8.5, { bold:true }); yy += 11; cl.forEach(c2 => { text("•  " + c2, M + 12, yy, 8); yy += 10; }); yy += 4; }
+        if (dl.length){ text("Discussion", M + 8, yy, 8.5, { bold:true }); yy += 11; dl.forEach(l2 => { text(l2, M + 8, yy, 8); yy += 10; }); }
+        top += bh + 8;
+      }
+      const cw = Math.min(24, (W - M - x0)/ncol), dh = 12, th = 18, rh = 13.2;
+      const xcol = ci => x0 + ci*cw;
+      /* day header */
+      rect(M, top, gw + lw + ncol*cw, dh + th, [244,247,247]);
+      let ci = 0;
+      pg.dayHdr.forEach(d => { text(d.label, xcol(ci) + 3, top + 9, 7.5, { bold:true }); ci += d.n; });
+      text("Parameter", M + 3, top + dh + 11, 7, { bold:true, color:[75,90,104] });
+      pg.times.forEach((t, k) => { text(t.t, xcol(k) + cw/2, top + dh + (t.sub ? 8 : 11), fitText(t.t, cw - 2, 7, true), { bold:true, align:"c" }); if (t.sub) text(t.sub, xcol(k) + cw/2, top + dh + 15.5, 5.5, { align:"c", color:[125,139,151] }); });
+      let y = top + dh + th;
+      line(M, y, xcol(ncol), y, 0.07, 1);
+      for (const g of pg.groups){
+        const gy = y;
+        rect(M, gy, gw, rh*g.rows.length, [244,247,247]);
+        /* group label, wrapped */
+        const words = g.g.split(" "); let ln = "", ly = gy + 9;
+        for (const w of words){ const t2 = ln ? ln + " " + w : w; if (tw(t2, 6.8, true) > gw - 10 && ln){ text(ln, M + 3, ly, 6.8, { bold:true }); ly += 8; ln = w; } else ln = t2; }
+        if (ln) text(ln, M + 3, ly, 6.8, { bold:true });
+        for (const r of g.rows){
+          let k = 0;
+          for (const c of r.cells){ const x = xcol(k), w = c.span*cw; if (c.fill) rect(x, y, w, rh, c.fill); text(c.text, x + w/2, y + 9.2, fitText(c.text, w - 2, 7, false), { align:"c", color: c.muted ? [154,166,176] : undefined }); k += c.span; }
+          { const sz = r.sub ? Math.min(6.8, fitText(r.label, lw - 8 - 2 - tw(r.sub, 5.6, false), 6.8, true)) : fitText(r.label, lw - 6, 6.8, true);
+            text(r.label, M + gw + 3, y + 9.2, sz, { bold:true, color:[75,90,104] });
+            if (r.sub) text(r.sub, M + gw + 3 + tw(r.label, sz, true) + 2, y + 9.2, 5.6, { color:[125,139,151] }); }
+          /* cell borders for this row */
+          let kk = 0; for (const c of r.cells){ line(xcol(kk), y, xcol(kk), y + rh, 0.84, 0.4); kk += c.span; }
+          y += rh;
+          line(M + gw, y, xcol(ncol), y, 0.86, 0.4);
+        }
+        line(M, y, xcol(ncol), y, 0.6, 0.8);
+      }
+      /* frame + day separators */
+      line(M, top, xcol(ncol), top, 0.6, 0.6); line(M, top, M, y, 0.6, 0.6); line(xcol(ncol), top, xcol(ncol), y, 0.6, 0.6);
+      line(M + gw, top + dh + th, M + gw, y, 0.6, 0.6); line(x0, top, x0, y, 0.45, 1);
+      ci = 0; pg.dayHdr.forEach((d, j) => { if (j) line(xcol(ci), top, xcol(ci), y, 0.45, 1.2); ci += d.n; });
+      text("3 hr and 6 hr probabilities cover the 3 or 6 hours starting at that time; a 1 hr chance appears only on hourly rows and a 3 hr chance only on rows of 3 hours or less.", M, Math.min(Hp - M, y + 14), 6.5, { color:[125,139,151] });
+      pages.push(cs.join("\n"));
+    });
+  }
+  return pdfAssemble(pages, logo, W, Hp);
+}
+
+
+/* ============================================================
+   Leadership quick look: one page built from the official forecast
+   ============================================================ */
+const HAZ = [
+  { id:"ltg",  label:"Lightning",          keys:["lt1","lt3","lt6"], mod:20, high:50 },
+  { id:"rain", label:"Rain",               keys:["pp1","pp3","pp6"], mod:30, high:60 },
+  { id:"s18",  label:"Sustained wind >18 kt", keys:["x18"], mod:20, high:50 },
+  { id:"g25",  label:"Peak wind >25 kt",   keys:["x25"], mod:20, high:50 },
+  { id:"g35",  label:"Peak wind >35 kt",   keys:["x35"], mod:10, high:30 },
+  { id:"heat", label:"Heat",               keys:["xhot"], mod:30, high:60 },
+  { id:"cold", label:"Cold <40°F",         keys:["x40"], mod:20, high:50 },
+  { id:"frz",  label:"Freeze <32°F",       keys:["x32"], mod:10, high:30 },
+  { id:"fog",  label:"Fog / vis <3 mi",    keys:["xvis"], mod:20, high:50 },
+  { id:"svr",  label:"Severe storms (SPC)", keys:["sev"] },
+];
+const LV = ["Low","Moderate","High"];
+const LVC = { 0:[47,122,74], 1:[214,152,32], 2:[178,58,46] };
+const levelOf = (h, v) => h.id === "svr" ? (v >= 2 ? 2 : v >= 1 ? 1 : 0) : v >= h.high ? 2 : v >= h.mod ? 1 : 0;
+const BRIEF_SITES = () => SITES.map(s => s.id);
+/* every number in the brief comes from the official forecast (guidance plus forecaster edits) */
+function briefData(){
+  const z = zulu(), rows = S.rows, sites = BRIEF_SITES().map(id => [SITES.find(s => s.id === id), officialFor(id)]);
+  const days = []; rows.forEach((r, i) => { const dk = dayKey(r.a, z); let d = days[days.length - 1]; if (!d || d.dk !== dk){ d = { dk, rows:[], a:r.a }; days.push(d); } d.rows.push(i); d.b = r.b; });
+  for (const d of days){
+    d.label = (() => { const L = dayLabel(d.a, z); return { wd: L.wd.slice(0, 3), dt: L.dt }; })();
+    d.haz = {};
+    for (const h of HAZ){
+      let mx = h.id === "svr" ? 0 : null, hits = [];
+      for (const [s, OFs] of sites){
+        for (const i of d.rows){
+          for (const k of h.keys){
+            let v = OFs.o[k] ? OFs.o[k][i] : undefined; if (v === undefined || v === null) continue;
+            if (h.id === "svr") v = v === "-" ? 0 : v === "MRGL" ? 1 : 2;
+            if (mx == null || v > mx) mx = v;
+            if (levelOf(h, v) >= 1) hits.push({ s, i, v });
+          }
+        }
+      }
+      d.haz[h.id] = { v: mx, lv: mx == null ? 0 : levelOf(h, mx), hits, sevTxt: h.id === "svr" ? (mx >= 2 ? "Slight or higher" : mx >= 1 ? "Marginal" : "None") : null };
+    }
+    /* daily summary */
+    let hi = null, lo = null, gust = null, skyN = {};
+    for (const [s, OFs] of sites) for (const i of d.rows){
+      const t = OFs.o.t[i]; if (t != null){ hi = hi == null ? t : Math.max(hi, t); lo = lo == null ? t : Math.min(lo, t); }
+      for (const k of PARAMS.filter(p => p.peakOf).map(p => p.k)){ const g = OFs.o[k] && OFs.o[k][i]; if (g != null) gust = gust == null ? g : Math.max(gust, g); }
+      const sk = OFs.o.sky[i]; if (sk != null && rows[i].lh >= 7 && rows[i].lh <= 18){ const c = skyCat(sk); skyN[c] = (skyN[c] || 0) + 1; }
+    }
+    const skyWord = { CLR:"Clear", FEW:"Mostly sunny", SCT:"Partly cloudy", BKN:"Mostly cloudy", OVC:"Overcast" };
+    const sky = Object.entries(skyN).sort((a, b) => b[1] - a[1])[0];
+    d.sum = { hi, lo, gust, sky: sky ? skyWord[sky[0]] : "" };
+  }
+  const cfg = briefCfg(), inc = HAZ.filter(h => !cfg.off[h.id]);
+  const active = h => days.some(d => d.haz[h.id].lv >= 1);
+  const shown = inc.filter(h => cfg.showLow || active(h));
+  const quiet = inc.filter(h => !active(h));
+  return { days, shown, quiet, sites };
+}
+/* concern sentences, most serious first; consecutive days with the same hazard are combined */
+const HPRI = ["svr","ltg","g35","g25","frz","heat","fog","s18","cold","rain"];
+const HNOUN = { ltg:"lightning", rain:"rain", s18:"sustained winds over 18 kt", g25:"peak winds over 25 kt", g35:"peak winds over 35 kt", heat:"heat", cold:"cold below 40°F", frz:"freezing temperatures", fog:"fog or low visibility", svr:"severe storms" };
+function hazRuns(D, id){
+  const runs = []; let cur = null;
+  D.days.forEach((d, j) => {
+    const hz = d.haz[id];
+    if (hz.lv >= 1){ if (cur && cur.j1 === j - 1){ cur.j1 = j; cur.days.push(d); } else { cur = { j0:j, j1:j, days:[d] }; runs.push(cur); } }
+  });
+  for (const r of runs){
+    r.lv = Math.max(...r.days.map(d => d.haz[id].lv)); r.v = Math.max(...r.days.map(d => d.haz[id].v ?? 0));
+    r.hits = r.days.flatMap(d => d.haz[id].hits);
+    const a = r.days[0].label, b = r.days[r.days.length - 1].label;
+    r.lab = r.days.length === 1 ? `${a.wd} ${a.dt}` : `${a.wd} ${a.dt.split(" ")[0]}${a.dt.split(" ")[1] === b.dt.split(" ")[1] ? "" : " " + a.dt.split(" ")[1]}–${b.wd} ${b.dt}`;
+    r.short = r.days.length === 1 ? a.wd : `${a.wd}–${b.wd}`;
+  }
+  return runs;
+}
+function whenPhrase(run){
+  if (run.days.length > 1) return "at times";
+  const d = run.days[0], z = zulu(), is = run.hits.map(x => x.i), ia = Math.min(...is), ib = Math.max(...is);
+  const first = d.rows[0], last = d.rows[d.rows.length - 1], tz = z ? "Z" : " " + tzAbbr(S.rows[ia].a);
+  if (ia === first && ib === last) return "much of the day";
+  if (ib === last) return `from ${hhmm(S.rows[ia].a, z)}${tz}`;
+  if (ia === first) return `until ${hhmm(S.rows[ib].b, z)}${tz}`;
+  return `${hhmm(S.rows[ia].a, z)}–${hhmm(S.rows[ib].b, z)}${tz}`;
+}
+function wherePhrase(D, hits){
+  const names = [...new Set(hits.map(x => x.s.name))];
+  if (names.length === D.sites.length) return "all forecast points";
+  return names.length > 2 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names.join(" and ");
+}
+function briefConcerns(D){
+  const out = [];
+  for (const h of D.shown) for (const r of hazRuns(D, h.id)){
+    const what = h.id === "svr" ? `SPC ${r.lv >= 2 ? "slight or higher" : "marginal"} risk of severe storms` : `${HNOUN[h.id]}, chance up to ${Math.round(r.v)}%`;
+    out.push({ lv:r.lv, pri:HPRI.indexOf(h.id), a:r.days[0].a, txt:`${r.lab}: ${what} at ${wherePhrase(D, r.hits)}, ${whenPhrase(r)}.` });
+  }
+  out.sort((x, y) => y.lv - x.lv || x.pri - y.pri || x.a - y.a);
+  return out.slice(0, 7).map(x => x.txt.charAt(0).toUpperCase() + x.txt.slice(1));
+}
+function briefBottomLine(D){
+  const items = D.shown.map(h => { const runs = hazRuns(D, h.id); return { h, runs, lv: Math.max(0, ...runs.map(r => r.lv)) }; }).filter(x => x.lv >= 1);
+  items.sort((x, y) => y.lv - x.lv || HPRI.indexOf(x.h.id) - HPRI.indexOf(y.h.id));
+  /* winds: mention only the strongest threshold that's a concern */
+  const windOrder = ["g35","g25","s18"], strongest = windOrder.find(id => items.some(x => x.h.id === id));
+  for (let k = items.length - 1; k >= 0; k--) if (windOrder.includes(items[k].h.id) && items[k].h.id !== strongest) items.splice(k, 1);
+  if (!items.length) return "No significant weather concerns for KSC, CCSFS or Patrick SFB through the forecast period.";
+  const parts = items.slice(0, 4).map(x => `${x.lv === 2 ? "high" : "moderate"} risk of ${HNOUN[x.h.id]} ${x.runs.map(r => r.short).join(" and ")}`);
+  let s = "Main concerns: " + parts.join("; ") + ".";
+  if (D.quiet.length){ const q = D.quiet.map(h => HNOUN[h.id]).slice(0, 4); s += " No concerns for " + (q.length > 1 ? q.slice(0, -1).join(", ") + " or " + q[q.length - 1] : q[0]) + "."; }
+  return s;
+}
+const BRIEF = { bottom:null, concerns:null };
+/* what the brief shows: hazards switched off are left out everywhere (chart, bottom line, concerns) */
+function briefCfg(){ prefs.brief = Object.assign({ off:{}, showLow:false, sum:{ sky:true, hilo:true, gust:true } }, prefs.brief || {}); prefs.brief.sum = Object.assign({ sky:true, hilo:true, gust:true }, prefs.brief.sum || {}); return prefs.brief; }
+const SUMROWS = [["sky","Sky"],["hilo","High / low (°F)"],["gust","Peak gusts (kt)"]];
+function renderBrief(regen){
+  const D = briefData();
+  const autoB = briefBottomLine(D), autoC = briefConcerns(D).join("\n");
+  /* keep the forecaster's wording unless it's still the automatic text */
+  if (regen || BRIEF.bottom == null || BRIEF.bottom === BRIEF.autoB) BRIEF.bottom = autoB;
+  if (regen || BRIEF.concerns == null || BRIEF.concerns === BRIEF.autoC) BRIEF.concerns = autoC;
+  BRIEF.autoB = autoB; BRIEF.autoC = autoC; BRIEF.D = D;
+  renderBriefCfg();
+  $("brBottom").value = BRIEF.bottom; $("brConcerns").value = BRIEF.concerns;
+  $("brPreview").innerHTML = briefHTMLBody(D, null);
+  BRIEF.D = D;
+}
+function briefHTMLBody(D, logo){
+  const issued = Date.now(), z = zulu(), tz = z ? "UTC" : tzAbbr(issued), by = (prefs.initials || "").toUpperCase();
+  const cell = (h, hz) => { const c = LVC[hz.lv]; const txt = h.id === "svr" ? (hz.sevTxt === "None" ? "–" : hz.sevTxt.replace(" or higher", "+")) : hz.v == null ? "–" : `${Math.round(hz.v)}%`; return `<td style="background:rgba(${c.join(",")},${hz.lv ? 0.85 : 0.16});color:${hz.lv ? "#fff" : "#2F5A3C"}">${txt}</td>`; };
+  const r0 = S.rows[0], r1 = S.rows[S.rows.length - 1];
+  let h = `<div class="bq-head">${logo ? `<img src="data:image/png;base64,${logo.b64}" alt="45th Weather Squadron">` : `<img src="${LOGO_SRC}" alt="45th Weather Squadron" onerror="this.remove()">`}<div><h1>Leadership Quick Look</h1><p>KSC, Cape Canaveral SFS and Patrick SFB. Issued ${dayLabel(issued, z).dt} ${hhmm(issued, z)} ${tz}${by ? " by " + hesc(by) : ""}. Valid ${dayLabel(r0.a, z).dt} ${hhmm(r0.a, z)} to ${dayLabel(r1.b, z).dt} ${hhmm(r1.b, z)} ${tz}.</p></div></div>`;
+  h += `<div class="bq-bl"><b>Bottom line</b>${hesc(BRIEF.bottom || "")}</div>`;
+  h += `<table class="bq-t"><thead><tr><th></th>${D.days.map(d => `<th>${d.label.wd}<small>${d.label.dt}</small></th>`).join("")}</tr></thead><tbody>`;
+  for (const hz of D.shown) h += `<tr><th>${hz.label}</th>${D.days.map(d => cell(hz, d.haz[hz.id])).join("")}</tr>`;
+  if (!D.shown.length) h += `<tr><th>All hazards</th>${D.days.map(() => `<td style="background:rgba(47,122,74,.16);color:#2F5A3C">Low</td>`).join("")}</tr>`;
+  const sc = briefCfg().sum;
+  if (sc.sky) h += `<tr class="sum"><th>Sky</th>${D.days.map(d => `<td>${d.sum.sky || "–"}</td>`).join("")}</tr>`;
+  if (sc.hilo) h += `<tr class="sum"><th>High / low (°F)</th>${D.days.map(d => `<td>${d.sum.hi == null ? "–" : `${Math.round(d.sum.hi)} / ${Math.round(d.sum.lo)}`}</td>`).join("")}</tr>`;
+  if (sc.gust) h += `<tr class="sum"><th>Peak gusts (kt)</th>${D.days.map(d => `<td>${d.sum.gust == null ? "–" : Math.round(d.sum.gust)}</td>`).join("")}</tr>`;
+  h += `</tbody></table>`;
+  const cs = (BRIEF.concerns || "").split("\n").map(x => x.trim()).filter(Boolean);
+  h += `<div class="bq-c"><b>Key concerns</b>${cs.length ? `<ul>${cs.map(c => `<li>${hesc(c)}</li>`).join("")}</ul>` : `<p>None.</p>`}</div>`;
+  h += `<p class="bq-n">Chance of each hazard at any time during the day at any of the ${D.sites.length} forecast points (${D.sites.map(x => x[0].point).join(", ")}). Green low, amber moderate, red high.${D.quiet.length ? " Not a concern this period: " + D.quiet.map(x => x.label).join(", ") + "." : ""}</p>`;
+  return h;
+}
+const BRIEF_CSS = `.bq-head{display:flex;gap:14px;align-items:center;margin-bottom:12px}.bq-head img{height:64px;width:auto}.bq-head h1{margin:0;font:700 24px/1.1 "Segoe UI",Arial,sans-serif}.bq-head p{margin:4px 0 0;color:#4B5A68;font-size:12.5px}
+.bq-bl{border-left:5px solid #13202E;background:#F4F7F7;padding:10px 14px;margin:0 0 14px;font-size:15px;line-height:1.45}.bq-bl b{display:block;font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:#4B5A68;margin-bottom:3px}
+table.bq-t{border-collapse:separate;border-spacing:3px;width:100%;font-size:13px;margin-bottom:12px}.bq-t th{text-align:left;font-weight:600;color:#13202E;padding:4px 8px;white-space:nowrap}.bq-t thead th{text-align:center;font-weight:700}.bq-t thead th small{display:block;font-weight:400;color:#7D8B97;font-size:11px}
+.bq-t td{text-align:center;padding:7px 4px;border-radius:5px;font-weight:700;min-width:62px}.bq-t tr.sum td{background:#F4F7F7;color:#13202E;font-weight:500}.bq-t tr.sum th{color:#4B5A68;font-weight:500}
+.bq-c{font-size:13.5px;line-height:1.45}.bq-c b{font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:#4B5A68}.bq-c ul{margin:4px 0 10px;padding-left:20px}.bq-n{font-size:11px;color:#7D8B97}`;
+function briefHTMLDoc(logo){
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Leadership Quick Look</title><style>body{font:14px/1.4 "Segoe UI",Arial,sans-serif;color:#13202E;margin:28px;max-width:1100px}${BRIEF_CSS}@media print{body{margin:10mm}}</style></head><body>${briefHTMLBody(BRIEF.D, logo)}</body></html>`;
+}
+function briefText(){
+  const D = BRIEF.D, z = zulu();
+  const lines = ["LEADERSHIP QUICK LOOK: KSC, CCSFS, PATRICK SFB", `Issued ${dayLabel(Date.now(), z).dt} ${hhmm(Date.now(), z)}${z ? "Z" : " " + tzAbbr(Date.now())}`, "", "BOTTOM LINE: " + BRIEF.bottom, ""];
+  for (const d of D.days){
+    const risks = D.shown.filter(h => d.haz[h.id].lv >= 1).map(h => `${h.label} ${h.id === "svr" ? d.haz[h.id].sevTxt : Math.round(d.haz[h.id].v) + "%"} (${LV[d.haz[h.id].lv].toLowerCase()})`);
+    const sc = briefCfg().sum, bits = [sc.sky ? d.sum.sky : "", sc.hilo && d.sum.hi != null ? `${Math.round(d.sum.hi)}/${Math.round(d.sum.lo)}°F` : "", sc.gust && d.sum.gust != null ? `gusts to ${Math.round(d.sum.gust)} kt` : ""].filter(Boolean);
+    lines.push(`${d.label.wd} ${d.label.dt}: ${bits.length ? bits.join(", ") + ". " : ""}${risks.length ? "Concerns: " + risks.join("; ") + "." : "No concerns."}`);
+  }
+  const cs = (BRIEF.concerns || "").split("\n").map(x => x.trim()).filter(Boolean);
+  if (cs.length) lines.push("", "KEY CONCERNS:", ...cs.map(c => "- " + c));
+  return lines.join("\n");
+}
+/* one landscape page, built with the same PDF writer as the forecast */
+function briefPDF(logo){
+  const D = BRIEF.D, W = 792, Hp = 612, M = 32, cs = [];
+  const f = n => (+n).toFixed(2), rgbf = c => c.map(x => f(x/255)).join(" ");
+  const rect = (x, y, w, h, fill) => cs.push(`${rgbf(fill)} rg ${f(x)} ${f(Hp - y - h)} ${f(w)} ${f(h)} re f`);
+  const text = (s, x, y, size, opt = {}) => { const w = textW(s, size, opt.bold); let tx = x; if (opt.align === "c") tx = x - w/2; else if (opt.align === "r") tx = x - w; cs.push(`BT ${rgbf(opt.color || [19,32,46])} rg /${opt.bold ? "F2" : "F1"} ${f(size)} Tf ${f(tx)} ${f(Hp - y)} Td ${pdfStr(s)} Tj ET`); };
+  const wrap = (s, maxW, size, bold) => { const words = String(s).split(/\s+/), out = []; let ln = ""; for (const w of words){ const t = ln ? ln + " " + w : w; if (textW(t, size, bold) > maxW && ln){ out.push(ln); ln = w; } else ln = t; } if (ln) out.push(ln); return out; };
+  const z = zulu(), issued = Date.now(), tz = z ? "UTC" : tzAbbr(issued), r0 = S.rows[0], r1 = S.rows[S.rows.length - 1];
+  const LH = logo ? 52 : 0, LW = logo ? LH*logo.rw/logo.rh : 0, TX = logo ? M + LW + 12 : M;
+  if (logo) cs.push(`q ${f(LW)} 0 0 ${f(LH)} ${f(M)} ${f(Hp - M + 6 - LH)} cm /Im1 Do Q`);
+  text("Leadership Quick Look", TX, M + 16, 20, { bold:true });
+  text(`KSC, Cape Canaveral SFS and Patrick SFB. Issued ${dayLabel(issued, z).dt} ${hhmm(issued, z)} ${tz}${prefs.initials ? " by " + prefs.initials.toUpperCase() : ""}. Valid ${dayLabel(r0.a, z).dt} ${hhmm(r0.a, z)} to ${dayLabel(r1.b, z).dt} ${hhmm(r1.b, z)} ${tz}.`, TX, M + 32, 9, { color:[75,90,104] });
+  let y = M + Math.max(44, LH + 2);
+  const bl = wrap(BRIEF.bottom || "", W - 2*M - 24, 11.5, false);
+  rect(M, y, W - 2*M, 22 + bl.length*15, [244,247,247]); rect(M, y, 4, 22 + bl.length*15, [19,32,46]);
+  text("BOTTOM LINE", M + 14, y + 13, 7.5, { bold:true, color:[75,90,104] });
+  bl.forEach((l, i) => text(l, M + 14, y + 28 + i*15, 11.5));
+  y += 30 + bl.length*15;
+  /* stoplight table */
+  const labW = 150, nd = D.days.length, cw = (W - 2*M - labW)/nd, rh = 21, gap = 2.5;
+  D.days.forEach((d, j) => { const cx = M + labW + j*cw + cw/2; text(d.label.wd, cx, y + 9, 9.5, { bold:true, align:"c" }); text(d.label.dt, cx, y + 19, 7.5, { align:"c", color:[125,139,151] }); });
+  y += 24;
+  const rowsH = [...(D.shown.length ? D.shown : [{ id:"none", label:"All hazards" }])];
+  for (const hz of rowsH){
+    text(hz.label, M + 2, y + 14, 9.5, { bold:true });
+    D.days.forEach((d, j) => {
+      const x = M + labW + j*cw + gap/2, v = hz.id === "none" ? { lv:0, v:null } : d.haz[hz.id];
+      const c = LVC[v.lv], fill = v.lv ? c : [230,240,233];
+      rect(x, y + 1, cw - gap, rh - gap, fill);
+      const txt = hz.id === "none" ? "Low" : hz.id === "svr" ? (v.sevTxt === "None" ? "-" : v.sevTxt.replace(" or higher", "+")) : v.v == null ? "-" : `${Math.round(v.v)}%`;
+      text(txt, x + (cw - gap)/2, y + 14, 9.5, { bold:true, align:"c", color: v.lv ? [255,255,255] : [47,90,60] });
+    });
+    y += rh;
+  }
+  const scp = briefCfg().sum;
+  for (const [lab, fn] of [["sky", "Sky", d => d.sum.sky || "-"], ["hilo", "High / low (°F)", d => d.sum.hi == null ? "-" : `${Math.round(d.sum.hi)} / ${Math.round(d.sum.lo)}`], ["gust", "Peak gusts (kt)", d => d.sum.gust == null ? "-" : String(Math.round(d.sum.gust))]].filter(x => scp[x[0]]).map(x => x.slice(1))){
+    text(lab, M + 2, y + 13, 9, { color:[75,90,104] });
+    D.days.forEach((d, j) => { const x = M + labW + j*cw + gap/2; rect(x, y + 1, cw - gap, rh - gap - 2, [244,247,247]); const t = fn(d); text(t, x + (cw - gap)/2, y + 13, fitSize(t, cw - 6, 9), { align:"c" }); });
+    y += rh - 2;
+  }
+  y += 10;
+  text("KEY CONCERNS", M, y + 8, 7.5, { bold:true, color:[75,90,104] }); y += 14;
+  const cs2 = (BRIEF.concerns || "").split("\n").map(x => x.trim()).filter(Boolean);
+  for (const c of (cs2.length ? cs2 : ["None."])){ const ls = wrap(c, W - 2*M - 16, 10, false); ls.forEach((l, i) => { if (i === 0) text("•", M + 2, y + 9, 10); text(l, M + 14, y + 9, 10); y += 13; }); y += 2; if (y > Hp - M - 30) break; }
+  const note = `Chance of each hazard at any time during the day at any of the ${D.sites.length} forecast points (${D.sites.map(x => x[0].point).join(", ")}). Green low, amber moderate, red high.${D.quiet.length ? " Not a concern this period: " + D.quiet.map(x => x.label).join(", ") + "." : ""}`;
+  wrap(note, W - 2*M, 7.5, false).forEach((l, i) => text(l, M, Hp - M - 10 + i*9 - (wrap(note, W - 2*M, 7.5, false).length - 1)*9, 7.5, { color:[125,139,151] }));
+  return pdfAssemble([cs.join("\n")], logo, W, Hp);
+}
+const fitSize = (s, maxW, size) => { let z = size; while (z > 5.5 && textW(s, z, false) > maxW) z -= 0.25; return z; };
+/* open the brief now, or as soon as guidance has loaded */
+function wantBrief(){
+  if (S.loading || !Object.keys(S.agg).length){ S.wantBrief = true; toast("Opening the leadership brief when guidance finishes loading"); return; }
+  if (location.hash === "#brief") history.replaceState(null, "", location.pathname + location.search);
+  openBrief();
+}
+function renderBriefCfg(){
+  const c = briefCfg(), D = BRIEF.D;
+  $("brHaz").innerHTML = HAZ.map(h => `<label><input type="checkbox" data-bh="${h.id}" ${c.off[h.id] ? "" : "checked"}> ${h.label}</label>`).join("");
+  $("brSum").innerHTML = SUMROWS.map(([k, l]) => `<label><input type="checkbox" data-bs="${k}" ${c.sum[k] ? "checked" : ""}> ${l}</label>`).join("");
+  $("brLow").checked = !!c.showLow;
+}
+function openBrief(){
+  if (!S.rows || !Object.keys(S.agg).length){ toast("Wait for guidance to load"); return; }
+  renderBrief(BRIEF.bottom == null);
+  $("briefDlg").showModal();
+}
+function bindBrief(){
+  if (EXPO) return;
+  const st = document.createElement("style"); st.textContent = BRIEF_CSS.replace(/(^|\})\s*\./g, "$1 .brprev ."); document.head.appendChild(st);
+  $("briefBtn").onclick = openBrief;
+  $("brClose").onclick = () => $("briefDlg").close();
+  $("brRegen").onclick = () => renderBrief(true);
+  const cfgChange = () => { savePrefs(); renderBrief(false); };
+  $("brHaz").onchange = e => { const id = e.target.dataset.bh; if (!id) return; const c = briefCfg(); if (e.target.checked) delete c.off[id]; else c.off[id] = true; cfgChange(); };
+  $("brSum").onchange = e => { const k = e.target.dataset.bs; if (!k) return; briefCfg().sum[k] = e.target.checked; cfgChange(); };
+  $("brLow").onchange = e => { briefCfg().showLow = e.target.checked; cfgChange(); };
+  $("brAll").onclick = () => { briefCfg().off = {}; cfgChange(); };
+  $("brBottom").oninput = e => { BRIEF.bottom = e.target.value; $("brPreview").innerHTML = briefHTMLBody(BRIEF.D, null); };
+  $("brConcerns").oninput = e => { BRIEF.concerns = e.target.value; $("brPreview").innerHTML = briefHTMLBody(BRIEF.D, null); };
+  const stamp = () => { const p = lp(Date.now()); return `${p.y}${pad2(p.mo)}${pad2(p.d)}_${pad2(p.h)}${pad2(p.mi)}`; };
+  $("brPdf").onclick = async () => { const logo = await loadLogo(); download(briefPDF(logo), `Leadership_Quick_Look_${stamp()}.pdf`); };
+  $("brHtml").onclick = async () => { const logo = await loadLogo(); download(new Blob([briefHTMLDoc(logo)], { type:"text/html" }), `Leadership_Quick_Look_${stamp()}.html`); };
+  $("brCopy").onclick = async () => { try { await navigator.clipboard.writeText(briefText()); toast("Copied as text for email"); } catch (e) { toast("Copy didn't work in this browser"); } };
+}
+
+let toastT = null;
+function toast(msg){ const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove("show"), 2600); }
+
+/* ============================================================
+   Loading
+   ============================================================ */
+function recomputeAgg(){ for (const s of SITES) if (S.G[s.id]){ S.agg[s.id] = aggregate(S.G[s.id], prefs); if (HOOKS.agg) HOOKS.agg(s.id, S.agg[s.id], S.G[s.id]); } }
+let renderT = null;
+function scheduleRender(){ if (renderT) return; renderT = setTimeout(() => { renderT = null; recomputeAgg(); renderAll(); renderSources(); }, 120); }
+const rowsNow = () => LMEF && HOOKS.rows ? HOOKS.rows() : EXPO ? buildRowsRange(prefs.exp.start, prefs.exp.end, prefs.exp.hourly === "all" ? Infinity : +prefs.exp.hourly) : buildRows(Date.now());
+/* keep every source's members so a new range or new wind heights can be applied without refetching */
+function addSrc(sid, d, members, extra){ (S.raw[sid] = S.raw[sid] || []).push([d, members, extra]); S.G[sid].addSource(d, members, extra); }
+function rebuildGuidance(){
+  S.rows = rowsNow(); S.spanCache = {}; CH.layout = null;
+  for (const s of SITES){
+    const old = S.G[s.id], G = new SiteGuidance(s, S.TL, S.rows); G.sev = old ? old.sev : [];
+    for (const [d, members, extra] of (S.raw[s.id] || [])){ members.forEach(m => deriveHeights(m, S.TL.n)); G.addSource(d, members, extra); }
+    S.G[s.id] = G;
+  }
+  if (!P[prefs.param] && !VIEWS[prefs.param]) prefs.param = "t";
+  clearSel(); recomputeAgg(); renderAll(); renderSources();
+}
+/* automatic model weights from the verification workflow (data/verif/weights.json) */
+async function loadAutoWeights(){
+  if (DEMO) return;
+  try { const j = await getJSON(`${DATA_BASE}data/verif/weights.json?ts=${Date.now()}`, 8000); AUTO_W = j && j.weights ? j : null; }
+  catch (e) { AUTO_W = null; }
+}
+async function loadAll(){
+  S.raw = {};
+  loadAutoWeights().then(() => { if (AUTO_W){ recomputeAgg(); scheduleRender(); } });
+  S.loading = true; S.rows = rowsNow(); S.spanCache = {}; S.TL = makeTimeline(Date.now()); S.G = {}; S.agg = {}; S.status = {}; S.fetchedAt = Date.now();
+  pruneEdits(); saveEdits();
+  for (const s of SITES) S.G[s.id] = new SiteGuidance(s, S.TL, S.rows);
+  ALL_SOURCES.forEach(d => S.status[d.id] = { loading:true });
+  renderSources(); recomputeAgg(); renderAll();
+  const tasks = [];
+  const det = (d, ens) => (DEMO ? demoOM(d, ens, S.TL) : fetchOM(d, ens, S.TL)).then(per => {
+    let n = 0; SITES.forEach((s, si) => { if (per[si] && per[si].length){ addSrc(s.id, d, per[si]); n = per[si].length; } });
+    S.status[d.id] = n ? { ok:true, note: ens ? `${n} members` : "loaded" } : { err:"no data for this area" };
+  }).catch(e => { S.status[d.id] = { err: e.name === "AbortError" ? "timed out" : "not available" }; }).finally(scheduleRender);
+  OM_DET.forEach(d => tasks.push(det(d, false)));
+  OM_ENS.forEach(d => tasks.push(det(d, true)));
+  /* waves and sea state, when asked */
+  if (PERSONAL && prefs.exp.marine){ S.status.marine = { loading:true }; tasks.push((DEMO ? demoMarine(S.TL) : fetchMarine(SITES, S.TL)).then(per => { const x = per[SITES[0].id]; if (x){ addSrc(SITES[0].id, MARINE, x.members); S.status.marine = { ok:true, note:"loaded" }; } else S.status.marine = { err:"no wave data here (inland?)" }; }).catch(() => { S.status.marine = { err:"not reachable" }; }).finally(scheduleRender)); }
+  if (!PERSONAL) MOS.forEach(d => tasks.push((DEMO ? demoMOS(d, S.TL) : fetchMOS(d, S.TL)).then(per => {
+    let n = 0, run = null, from = "";
+    SITES.forEach(s => { const x = per[s.stn]; if (x && x.members[0].t.some(v => v != null)){ addSrc(s.id, d, x.members, { iv:x.iv, run:x.run }); n++; run = x.run; from = x.from; } });
+    S.status[d.id] = n ? { ok:true, note: run ? `${pad2(new Date(run).getUTCHours())}Z run${from === "mirror" ? ", mirror" : ""}` : "loaded" } : { err:"no stations" };
+  }).catch(e => { S.status[d.id] = { err:"not reachable" }; }).finally(scheduleRender)));
+  /* the NWS forecast (NDFD) for each point */
+  S.status.ndfd = { loading:true };
+  tasks.push((DEMO ? demoNDFD(S.TL) : fetchNDFD(SITES, S.TL)).then(per => {
+    let n = 0; SITES.forEach(s => { const x = per[s.id]; if (x && x.members[0].t.some(v => v != null)){ addSrc(s.id, NDFD, x.members, { iv:x.iv, run:x.run }); n++; } });
+    S.status.ndfd = n ? { ok:true, note: per[SITES[0].id] && per[SITES[0].id].run ? `issued ${pad2(new Date(per[SITES[0].id].run).getUTCHours())}${pad2(new Date(per[SITES[0].id].run).getUTCMinutes())}Z` : "loaded" } : { err:"not reachable" };
+  }).catch(() => { S.status.ndfd = { err:"not reachable" }; }).finally(scheduleRender));
+  if (!PERSONAL) PIPE.forEach(d => S.status[d.id] = { loading:true });
+  if (!PERSONAL) tasks.push((DEMO ? demoPipeline(S.TL) : fetchPipeline(S.TL)).then(res => {
+    for (const d of PIPE){
+      const x = res[d.id];
+      const why = (res._status || {})[d.id];
+      if (!x || !Object.keys(x.per).length){ S.status[d.id] = { err: why || "not in this run" }; continue; }
+      SITES.forEach(s => { const p = x.per[s.id]; if (p) addSrc(s.id, d, p.members, p.iv ? { iv:p.iv, run:x.run } : null); });
+      const ageH = (Date.now() - x.run)/H;
+      S.status[d.id] = { ok:true, note: `${pad2(new Date(x.run).getUTCHours())}Z run${x.n > 1 ? `, ${x.n} members` : ""}${d.id === "refsm" && x.n && x.n < 5 ? " (some members missing)" : ""}${ageH > 13 ? ` · ${Math.round(ageH)} h old` : ""}` };
+    }
+  }).catch(e => { PIPE.forEach(d => S.status[d.id] = { err:"pipeline file missing" }); }).finally(scheduleRender));
+  if (!PERSONAL) tasks.push((DEMO ? demoSPC() : fetchSPC()).then(sev => { for (const s of SITES) S.G[s.id].sev = sev; }).finally(scheduleRender));
+  await Promise.allSettled(tasks);
+  S.loading = false; S.fetchedAt = Date.now(); scheduleRender();
+  if (!EXPO && (S.wantBrief || location.hash === "#brief")){ S.wantBrief = false; setTimeout(wantBrief, 400); }
+}
+
+/* ---------- demo data (only with ?demo=1) ---------- */
+async function demoMarine(TL){
+  const m = {}; MARINE_KEYS.forEach(k => m[k] = new Array(TL.n).fill(null));
+  for (let i = 0; i < TL.n; i++){ m.wvh[i] = 2.5 + 1.2*Math.sin(i/14); m.swh[i] = 1.8 + 0.6*Math.sin(i/20); m.wvp[i] = 8 + 2*Math.sin(i/30); m.wvd[i] = 80; m.sst[i] = 79; }
+  return { [SITES[0].id]: { members:[marineMember(m, TL.n)] } };
+}
+async function demoNDFD(TL){
+  const out = {}, r = rng(7);
+  SITES.forEach(s => { const m = demoSeries(TL, r, 0.5); m.gap = 3; deriveMember(m, TL.n); out[s.id] = { members:[m], iv:{ pop:[], tst:[] }, run: Date.now() - 3*H }; });
+  return out;
+}
+function rng(seed){ let x = seed >>> 0 || 1; return () => (x = (x * 1664525 + 1013904223) >>> 0) / 4294967296; }
+function demoSeries(TL, r, bias){
+  const m = {}; ["t","td","sky","s10","d10","g10","s80","vis","sw","pr","pp","cl","cm","ch","lcb"].forEach(k => m[k] = new Array(TL.n).fill(null));
+  const front = TL.t0 + (70 + r()*10) * H;
+  for (let i = 0; i < TL.n; i++){
+    const t = TL.t0 + i*H, h = lp(t).h, post = t > front;
+    const diur = Math.sin((h - 9) / 24 * 2*Math.PI);
+    m.t[i] = 78 + bias + 6*diur - (post ? 9 : 0) + (r() - 0.5)*1.5;
+    m.td[i] = (post ? 55 : 70) + bias*0.5 + (r() - 0.5)*2;
+    m.sky[i] = Math.max(0, Math.min(100, (post ? 15 : 45) + 35*Math.sin(i/9 + bias) + (r() - 0.5)*25));
+    m.s10[i] = Math.max(1, (post ? 15 : 9) + 3*diur + (r() - 0.5)*4 + bias*0.4);
+    m.d10[i] = ((post ? 340 : 120) + (r() - 0.5)*30 + 360) % 360;
+    m.g10[i] = m.s10[i] * (1.35 + r()*0.2);
+    m.s80[i] = m.s10[i] * 1.32;
+    m.vis[i] = r() < 0.04 ? 3000 : 16000;
+    m.sw[i] = Math.max(0, 850*Math.sin((h - 6)/12*Math.PI));
+    m.pr[i] = !post && h >= 13 && h <= 19 && r() < 0.18 ? 0.05 + r()*0.3 : (Math.abs(t - front) < 6*H && r() < 0.4 ? 0.1 : 0);
+    m.pp[i] = !post && h >= 13 && h <= 19 ? 25 + r()*20 : 5;
+    m.cl[i] = Math.min(100, m.sky[i]*0.7); m.cm[i] = Math.min(100, m.sky[i]*0.4); m.ch[i] = Math.min(100, m.sky[i]*0.6); m.lcb[i] = 3500 + r()*1500;
+    if (BURN){
+      /* demo fire weather: a daytime mixed layer, winds increasing with height */
+      const day = Math.max(0, Math.sin((h - 8)/11*Math.PI));
+      m.td[i] -= 16*day;
+      (m.blh = m.blh || [])[i] = 180 + 1300*day + (r() - 0.5)*150;
+      [[975,300],[950,550],[925,800],[900,1050],[850,1550],[800,2050]].forEach(([p, z], k) => { (m["z" + p] = m["z" + p] || [])[i] = z; (m["ws" + p] = m["ws" + p] || [])[i] = m.s80[i]*(1.05 + 0.12*k); (m["wd" + p] = m["wd" + p] || [])[i] = (m.d10[i] + 8*k) % 360; });
+      (m.t950 = m.t950 || [])[i] = m.t[i] - 5 - 3*day; (m.t850 = m.t850 || [])[i] = m.t[i] - 16 - 2*day; (m.rh950 = m.rh950 || [])[i] = 75; (m.rh850 = m.rh850 || [])[i] = 45 + 25*r();
+    }
+  }
+  return m;
+}
+async function demoOM(d, ens, TL){
+  await new Promise(r => setTimeout(r, 60 + Math.random()*300));
+  if (d.id === "ukmo") throw new Error("demo outage");
+  return SITES.map((s, si) => {
+    const r = rng((d.id.charCodeAt(0) * 97 + d.id.length * 31 + si * 7) | 0); const n = ens ? 20 : 1;
+    const ms = []; for (let k = 0; k < n; k++){ const m = demoSeries(TL, r, (r() - 0.5)*4 + (si === 4 ? 1.5 : 0)); if (d.fam === "hires") for (let i = 48; i < TL.n; i++) Object.keys(m).forEach(x => m[x][i] = null); if (d.id !== "nbm") m.pp = new Array(TL.n).fill(null); m.gap = 3; deriveMember(m, TL.n); ms.push(m); }
+    return ms;
+  });
+}
+async function demoMOS(d, TL){
+  await new Promise(r => setTimeout(r, 100 + Math.random()*300));
+  const out = {};
+  STATIONS.forEach((stn, si) => {
+    const r = rng(d.model.charCodeAt(0)*13 + si); const m = demoSeries(TL, r, 0);
+    const step = d.model === "LAV" ? 1 : 3, span = d.model === "LAV" ? 25 : d.model === "NBS" ? 72 : d.model === "GFSX" || d.model === "NBE" ? 190 : 72;
+    Object.keys(m).forEach(k => { for (let i = 0; i < TL.n; i++) if (i < 6 || i > 6 + span || (i % step)) m[k][i] = null; });
+    const iv = { pop:[], tst:[] }; const L = d.model === "LAV" ? 1 : d.model === "GFSX" || d.model === "NBE" ? 12 : 6, Lt = d.model === "LAV" ? 2 : d.model === "NBS" ? 3 : L;
+    for (let t = TL.t0 + 6*H; t < TL.t0 + (6 + span)*H; t += L*H){ const h = lp(t).h; iv.pop.push({ a:t, b:t + L*H, p: h >= 12 && h <= 20 ? 0.2 + r()*0.3 : 0.05 }); }
+    for (let t = TL.t0 + 6*H; t < TL.t0 + (6 + span)*H; t += Lt*H){ const h = lp(t).h; iv.tst.push({ a:t, b:t + Lt*H, p: h >= 13 && h <= 19 && t < TL.t0 + 76*H ? 0.1 + r()*0.25 : 0.01 }); }
+    m.gap = L; deriveMember(m, TL.n);
+    out[stn] = { members:[m], iv, run: Math.floor(Date.now()/(6*H))*6*H - 6*H, from:"demo" };
+  });
+  return out;
+}
+async function demoPipeline(TL){
+  await new Promise(r => setTimeout(r, 200));
+  const out = {};
+  const run = Math.floor(Date.now()/(6*H))*6*H - 6*H;
+  for (const d of PIPE){
+    const per = {};
+    SITES.forEach((s, si) => {
+      const r = rng(d.id.length*101 + si*17);
+      if (d.fam === "ct"){
+        const tst = [], tst4 = [], maxh = d.id === "hrefct" ? 48 : 60;
+        for (let h = 1; h <= maxh; h++){ const b = run + h*H, lh = lp(b).h; const base = lh >= 13 && lh <= 20 && h < 40 ? 0.08 + r()*0.25 : 0.01; tst.push({ a:b - H, b, p:base }); if (h >= 4) tst4.push({ a:b - 4*H, b, p:Math.min(0.9, base*2.2) }); }
+        per[s.id] = { members:[], iv:{ tst, tst4 } };
+      } else {
+        const n = d.id === "refsm" ? 5 : 1, ms = [];
+        for (let k = 0; k < n; k++){ const m = demoSeries(TL, r, (r() - 0.5)*3); const lim = TL.idx(run + (d.id === "rrfs" ? 84 : 60)*H); Object.keys(m).forEach(x => { for (let i = Math.max(0, lim); i < TL.n; i++) m[x][i] = null; }); m.pp = new Array(TL.n).fill(null); m.gap = 3; ms.push(deriveMember(m, TL.n)); }
+        per[s.id] = { members: ms, iv:null };
+      }
+    });
+    out[d.id] = { run, per, n: d.id === "refsm" ? 5 : 1 };
+  }
+  return out;
+}
+async function demoSPC(){ const t = Date.now(); const d = new Date(t); const v = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 12); return [{ cat:"MRGL", a:v, b:v + 24*H, geom:{ type:"Polygon", coordinates:[[[-81.5,27.5],[-80,27.5],[-80,29.5],[-81.5,29.5],[-81.5,27.5]]] } }]; }
+
+/* ============================================================
+   Events
+   ============================================================ */
+function bind(){
+  document.querySelectorAll(".pagenav a").forEach(a => { if (a.dataset.page === PAGE) a.setAttribute("aria-current", "page"); });
+  if (!EXPO){
+    const nb = document.querySelector('.pagenav a[data-page="brief"]');
+    if (nb) nb.addEventListener("click", ev => { ev.preventDefault(); wantBrief(); });
+    window.addEventListener("hashchange", () => { if (location.hash === "#brief") wantBrief(); });
+  }
+  window.addEventListener("themechange", () => { CH.layout = null; renderChart(); });
+  $("sites").addEventListener("click", ev => { const b = ev.target.closest("[data-site]"); if (!b) return; prefs.site = b.dataset.site; savePrefs(); S.cur = null; clearSel(); renderAll(); renderExpSetup(); });
+  $("locator").addEventListener("click", ev => { const b = ev.target.closest("[data-site]"); if (!b) return; prefs.site = b.dataset.site; savePrefs(); renderAll(); });
+  $("params").addEventListener("click", ev => { const b = ev.target.closest("[data-p]"); if (!b) return; if (prefs.param !== b.dataset.p) clearSel(); prefs.param = b.dataset.p; savePrefs(); renderParams(); renderChart(); renderMatrix(); });
+  $("undo").onclick = undo; $("redo").onclick = redo;
+  $("drawSel").addEventListener("click", ev => { const b = ev.target.closest("[data-d]"); if (!b) return; prefs.draw = b.dataset.d; savePrefs(); renderChart(); });
+  $("resetSite").onclick = () => {
+    const n = editCount(prefs.site); if (!n){ toast("No edits to clear"); return; }
+    if (!confirm(`Clear all ${n} edits for ${site().name}? You can undo this.`)) return;
+    const g = []; const e = edits[prefs.site] || {}; for (const k in e) for (const key in e[k]) setEdit(prefs.site, k, key, undefined, g); commit(g); toast("Reset to guidance");
+  };
+  $("modeSel").addEventListener("click", ev => { const b = ev.target.closest("[data-m]"); if (!b) return; prefs.cmode = b.dataset.m; savePrefs(); renderChart(); });
+  $("resetParam").onclick = () => {
+    if (CH.sel.size){ applyToPoints(() => null, selList()); return; }
+    const g = []; for (const k of toolKeysG()){ const m = (edits[prefs.site] || {})[k] || {}; for (const key in m) setEdit(prefs.site, k, key, undefined, g); } commit(g);
+  };
+  $("nudgeUp").onclick = () => nudgeSel(1); $("nudgeDn").onclick = () => nudgeSel(-1);
+  const setTo = () => {
+    const ks = keysOf(prefs.param), v = parseInput(P[ks[0]], $("setVal").value);
+    if (v === undefined || v === null){ toast("Type a value first"); $("setVal").focus(); return; }
+    applyToPoints(k => v, scopePoints());
+  };
+  $("setGo").onclick = setTo; $("setVal").addEventListener("keydown", ev => { if (ev.key === "Enter"){ ev.preventDefault(); setTo(); } });
+  $("smooth").onclick = () => {
+    if (P[keysOf(prefs.param)[0]].kind === "dir") return toast("Smoothing isn't available for direction");
+    const list = CH.sel.size ? selList() : scopePoints().filter(q => rawEdit(q.k, S.rows[q.i].key) !== undefined);
+    if (!list.length) return toast("Select or edit some points first, then smooth them");
+    const keep = {}; for (const q of list) (keep[q.k] = keep[q.k] || new Set()).add(q.i);
+    const g = [];
+    for (const k in keep){
+      const pts = CH.hits.filter(h => h.k === k).map(h => h.i).sort((a, b) => a - b), v = OF.o[k];
+      pts.forEach((i, j) => { if (!keep[k].has(i)) return; const a = v[pts[j - 1] ?? i], b = v[pts[j + 1] ?? i]; writeCell(k, i, clampV(k, (a + 2*v[i] + b)/4), g); });
+    }
+    commit(g);
+  };
+  $("publish").onclick = openPublish;
+  $("pubDlg").addEventListener("close", () => { if ($("pubDlg").returnValue === "ok") doPublish(); });
+  $("pubForm").addEventListener("submit", ev => { if (ev.submitter && ev.submitter.value === "ok" && !$("pubInit").value.trim()){ ev.preventDefault(); $("pubInit").focus(); } });
+  $("orD").onclick = () => { prefs.orient = "down"; savePrefs(); renderAll(); };
+  $("orA").onclick = () => { prefs.orient = "across"; savePrefs(); renderAll(); };
+  document.querySelectorAll("#wuSel button").forEach(b => b.setAttribute("aria-pressed", b.dataset.u === wuLabel()));
+  $("wuSel").onclick = ev => { const b = ev.target.closest("[data-u]"); if (!b) return; prefs.wu = b.dataset.u; savePrefs(); CH.layout = null; document.querySelectorAll("#wuSel button").forEach(x => x.setAttribute("aria-pressed", x.dataset.u === wuLabel())); renderAll(); };
+  $("tzL").onclick = () => { prefs.tz = "L"; savePrefs(); renderAll(); renderExpSetup(); };
+  $("tzZ").onclick = () => { prefs.tz = "Z"; savePrefs(); renderAll(); renderExpSetup(); };
+  $("refresh").onclick = () => { if (S.loading) return; loadAll(); };
+  $("initials").value = prefs.initials || ""; $("initials").oninput = e => { prefs.initials = e.target.value.toUpperCase(); savePrefs(); };
+  $("linkProbs").checked = prefs.link; $("linkProbs").onchange = e => { prefs.link = e.target.checked; savePrefs(); renderAll(); };
+  $("linkWin").checked = prefs.linkWin !== false; $("linkWin").onchange = e => { prefs.linkWin = e.target.checked; savePrefs(); renderAll(); };
+  $("clampProbs").checked = prefs.clamp; $("clampProbs").onchange = e => { prefs.clamp = e.target.checked; savePrefs(); renderAll(); };
+  $("hotThr").onchange = e => { const v = parseFloat(e.target.value); if (isFinite(v)){ prefs.hot[prefs.site] = v; savePrefs(); renderAll(); } };
+  if (EXPO) document.querySelectorAll('.pagenav a[data-page="verify"]').forEach(a => { a.href = "verify.html#exposure"; a.addEventListener("click", () => { try { localStorage.setItem("erwx:verifyMode", "exposure"); } catch (e) { /* ignore */ } }); });
+  const lb = document.getElementById("linkBar");
+  if (lb){
+    lb.addEventListener("change", ev => {
+      if (ev.target.id === "linkSw"){ prefs.linkPts = ev.target.checked; savePrefs(); renderLinkBar(); toast(prefs.linkPts ? "Edits apply to the other points" : "Edits change this point only"); }
+      else if (ev.target.dataset.lt){ prefs.linkTo = prefs.linkTo || {}; prefs.linkTo[ev.target.dataset.lt] = ev.target.checked; savePrefs(); }
+    });
+    lb.addEventListener("click", ev => { if (ev.target.closest("#consBtn")) openConsistency(); });
+  }
+  const cd = document.getElementById("conDlg");
+  if (cd) cd.addEventListener("click", ev => {
+    const b = ev.target.closest("button"); if (!b) return;
+    const it = cd._list && cd._list[+(b.dataset.go ?? b.dataset.al)];
+    if (b.dataset.go != null && it){ prefs.site = it.a; savePrefs(); if (it.k){ prefs.param = it.k.replace(/^(pp|lt)\d$/, m => m.slice(0, 2)); } cd.close(); renderAll(); selectCell(it.i, it.k || "lt" + it.w, true); }
+    else if (b.dataset.al != null && it){ alignPoints(b.dataset.from, b.dataset.to, it.k); openConsistency(); }
+    else if (b.id === "conClose") cd.close();
+    else if (b.id === "conCarry"){ carryAll(prefs.site); openConsistency(); }
+  });
+  const rb = document.getElementById("recentBody");
+  if (rb) rb.addEventListener("click", ev => {
+    const r = ev.target.closest("[data-rs]"); if (r){ RECENT.sel = RECENT.sel === r.dataset.rs ? null : r.dataset.rs; renderRecent(); return; }
+    const b = ev.target.closest("[data-rp]"); if (b){ RECENT.part = +b.dataset.rp; renderRecent(); }
+  });
+  const awEl = document.getElementById("autoW");
+  if (awEl) awEl.addEventListener("change", e => { prefs.autoW = e.target.checked; savePrefs(); recomputeAgg(); renderAll(); renderSources(); });
+  $("srcgrid").addEventListener("change", ev => {
+    const t = ev.target;
+    if (t.dataset.src){ prefs.enabled[t.dataset.src] = t.checked; }
+    if (t.dataset.w){ prefs.weight[t.dataset.w] = parseFloat(t.value); }
+    savePrefs(); recomputeAgg(); renderAll(); renderSources();
+  });
+  /* matrix */
+  const mx = $("matrix");
+  mx.addEventListener("click", ev => {
+    const th = ev.target.closest("th[data-p]"); if (th){ if (P[th.dataset.p].kind !== "sev"){ if (viewOf(th.dataset.p) !== prefs.param) clearSel(); prefs.param = viewOf(th.dataset.p); savePrefs(); renderParams(); renderChart(); renderMatrix(); $("chart").scrollIntoView({ block:"nearest", behavior:"smooth" }); } return; }
+    const td = ev.target.closest("td.c"); if (!td || ev.target.tagName === "INPUT" || ev.target.tagName === "SELECT") return;
+    const i = +td.dataset.i, k = td.dataset.k;
+    if (S.cur && S.cur.i === i && S.cur.k === k && !td.classList.contains("na")) openEditor(i, k);
+    else { selectCell(i, k); mx.focus({ preventScroll:true }); }
+  });
+  mx.addEventListener("dblclick", ev => { const td = ev.target.closest("td.c"); if (td) openEditor(+td.dataset.i, td.dataset.k); });
+  mx.addEventListener("mouseover", ev => {
+    const el = across() ? ev.target.closest("[data-i]") : ev.target.closest("tbody tr");
+    if (!el) return; const i = across() ? +el.dataset.i : +el.dataset.r;
+    if (!isFinite(i) || S.hoverRow === i) return; S.hoverRow = i; markHover(i); moveCursor(i);
+  });
+  mx.addEventListener("mouseleave", () => { S.hoverRow = null; markHover(null); moveCursor(null); });
+  mx.addEventListener("keydown", ev => {
+    if (editor || !S.cur) return;
+    const ks = PARAMS.map(p => p.k); let { i, k } = S.cur; let ki = ks.indexOf(k);
+    const mv = (di, dk) => {
+      ev.preventDefault();
+      if (di > 0){ const sp = spanMap(ks[ki])[i]; i += sp && sp.s ? sp.s : 1; } else if (di < 0) i -= 1;
+      i = Math.max(0, Math.min(S.rows.length - 1, i)); ki = Math.max(0, Math.min(ks.length - 1, ki + dk));
+      i = ownerIdx(ks[ki], i); selectCell(i, ks[ki], true);
+    };
+    if (ev.key === "ArrowDown") return mv(...visStep(1, 0));
+    if (ev.key === "ArrowUp") return mv(...visStep(-1, 0));
+    if (ev.key === "ArrowRight" || (ev.key === "Tab" && !ev.shiftKey)) return mv(...visStep(0, 1));
+    if (ev.key === "ArrowLeft" || (ev.key === "Tab" && ev.shiftKey)) return mv(...visStep(0, -1));
+    if (ev.key === "Enter" || ev.key === "F2"){ ev.preventDefault(); return openEditor(i, k); }
+    if (ev.key === "Delete" || ev.key === "Backspace"){ ev.preventDefault(); const g = []; writeCell(k, i, null, g); commit(g); selectCell(i, k); return; }
+    if (ev.key.length === 1 && !ev.ctrlKey && !ev.metaKey && !ev.altKey && /[0-9a-zA-Z.\-]/.test(ev.key)){ ev.preventDefault(); openEditor(i, k, P[k].kind === "sky" || P[k].kind === "sev" ? null : ev.key); }
+  });
+  mx.addEventListener("paste", ev => {
+    if (editor || !S.cur) return;
+    const txt = (ev.clipboardData || window.clipboardData).getData("text"); if (!txt) return;
+    ev.preventDefault();
+    const lines = txt.replace(/\r/g, "").split("\n"); if (lines[lines.length - 1] === "") lines.pop();
+    const ks = PARAMS.map(p => p.k), k0 = ks.indexOf(S.cur.k), g = []; let bad = 0, ri = S.cur.i;
+    if (across()){
+      /* lines are parameters, tab-separated cells run along time */
+      lines.forEach((ln, li) => {
+        const k = ks[k0 + li]; if (!k) return; let i = S.cur.i;
+        for (const cell of ln.split("\t")){
+          while (i < S.rows.length && OF.o[k][i] === undefined) i++;
+          if (i >= S.rows.length) break;
+          const v = parseInput(P[k], cell); if (v === undefined){ if (cell.trim()) bad++; } else writeCell(k, i, v, g);
+          i++;
+        }
+      });
+      commit(g); toast(`Pasted ${g.length} value${g.length === 1 ? "" : "s"}${bad ? `, skipped ${bad} unreadable` : ""}`);
+      return;
+    }
+    for (const ln of lines){
+      while (ri < S.rows.length && OF.o[S.cur.k][ri] === undefined) ri++;
+      if (ri >= S.rows.length) break;
+      ln.split("\t").forEach((cell, c) => { const k = ks[k0 + c]; if (!k) return; const v = parseInput(P[k], cell); if (v === undefined){ if (cell.trim()) bad++; return; } writeCell(k, ri, v, g); });
+      ri++;
+    }
+    commit(g); toast(`Pasted ${g.length} value${g.length === 1 ? "" : "s"}${bad ? `, skipped ${bad} unreadable` : ""}`);
+  });
+  document.addEventListener("keydown", ev => {
+    const mod = ev.ctrlKey || ev.metaKey; if (!mod || editor) return;
+    if (ev.target.tagName === "INPUT" && ev.target.type === "text" && ev.target.id !== "") return;
+    if (ev.key.toLowerCase() === "z" && !ev.shiftKey){ ev.preventDefault(); undo(); }
+    else if ((ev.key.toLowerCase() === "z" && ev.shiftKey) || ev.key.toLowerCase() === "y"){ ev.preventDefault(); redo(); }
+  });
+  bindChart();
+}
+/* the LMEF page loads this file as a library (exports, logo, PDF writer) and runs its own UI */
+bind();
+bindExp();
+if (!LMEF) bindBrief();
+if (HOOKS.bind) HOOKS.bind();
+loadAll();
