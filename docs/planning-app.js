@@ -1069,7 +1069,7 @@ function renderTable(){
     const dk = dayKey(r.a, z), ds = dk !== lastDay, bs = r.len !== lastBlk && !ds; lastDay = dk; lastBlk = r.len;
     let cls = (ds ? "dstart " : "") + (bs ? "sect " : "") + (S.hoverRow === i ? "hov" : "");
     h += `<tr data-r="${i}" class="${cls}">`;
-    if (ds){ const L = dayLabel(r.a, z); const today = i === 0 ? "Today" : (dayKey(r.a, z) === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<td class="stick day" rowspan="${dayRuns[dk]}"><b>${today}</b>${today === L.wd ? "" : L.wd + "<br>"}${L.dt}</td>`; }
+    if (ds){ const L = dayLabel(r.a, z); const today = dayKey(r.a, z) === dayKey(Date.now(), z) ? "Today" : (dayKey(r.a, z) === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<td class="stick day" rowspan="${dayRuns[dk]}"><b>${today}</b>${today === L.wd ? "" : L.wd + "<br>"}${L.dt}</td>`; }
     h += `<td class="stick2 tm">${rowTime(r)}${r.len > 1 ? `<small>${r.len} h</small>` : ""}</td>`;
     lastG = null;
     for (const p of PARAMS){
@@ -1093,7 +1093,7 @@ function renderTableAcross(){
   const dstart = new Set(days.map(d => d.i));
   const tlab = r => { const a = hhmm(r.a, z).slice(0, 2); return r.len === 1 ? a : `${a}–${hhmm(r.b, z).slice(0, 2)}`; };
   let h = `<table class="mx across"><thead><tr class="g"><th class="stick" colspan="2">${tzLabel()}</th>`;
-  days.forEach((d, j) => { const L = dayLabel(rows[d.i].a, z); const nm = j === 0 ? "Today" : (d.dk === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<th colspan="${d.n}" class="dcol">${d.n >= 3 ? `${nm}, ${L.dt}` : L.dt}</th>`; });
+  days.forEach((d, j) => { const L = dayLabel(rows[d.i].a, z); const nm = d.dk === dayKey(Date.now(), z) ? "Today" : (d.dk === dayKey(Date.now() + 24*H, z) ? "Tomorrow" : L.wd); h += `<th colspan="${d.n}" class="dcol">${d.n >= 3 ? `${nm}, ${L.dt}` : L.dt}</th>`; });
   h += `</tr><tr class="c"><th class="stick">Parameter</th><th class="stick2"></th>`;
   rows.forEach((r, i) => { h += `<th data-i="${i}" class="tcol ${dstart.has(i) ? "dcol" : ""} ${S.hoverRow === i ? "hov" : ""}">${tlab(r)}${r.len > 1 ? `<small>${r.len} h</small>` : ""}</th>`; });
   h += `</tr></thead><tbody>`;
