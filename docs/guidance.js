@@ -345,6 +345,7 @@ function lvori(rh, di){
   let k = 0; LVORI_COLS.forEach((c, j) => { if (di <= c) k = j + 1; });
   return row[k];
 }
+if (typeof window !== "undefined" && window.PAGE === "personal") VMAP.weather_code = "wc";
 const VKEYS = Object.keys(VMAP).sort((a, b) => b.length - a.length);
 async function getJSON(url, ms){
   const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), ms || 30000);
@@ -360,7 +361,8 @@ async function fetchOM(src, ens, TL){
   const base = ens ? "https://ensemble-api.open-meteo.com/v1/ensemble" : "https://api.open-meteo.com/v1/forecast";
   let js;
   const vars = ens ? OM_VARS_ENS : OM_VARS;
-  try { js = await getJSON(omURL(base, src.model, FIRE ? vars + "," + FIRE_VARS : vars), 45000); }
+  /* extra fields: fire weather on the burn page; the weather code (thunder) on the personal page */
+  try { js = await getJSON(omURL(base, src.model, FIRE ? vars + "," + FIRE_VARS : PERS ? vars + ",weather_code" : vars), 45000); }
   catch (e){
     if (e.status !== 400) throw e;
     /* a model without some fire-weather fields: try without them, then the minimum set */
@@ -524,6 +526,15 @@ async function fetchNDFD(sites, TL){
       /* probabilities as intervals, like MOS */
       const ivs = (name, kind) => { const prop = P[name]; if (!prop || !prop.values) return; for (const it of prop.values){ const [st, d] = String(it.validTime).split("/"); const a = Date.parse(st); if (it.value == null) continue; iv[kind].push({ a, b: a + dur(d)*H, p: Math.max(0, Math.min(1, it.value/100)) }); } };
       ivs("probabilityOfPrecipitation", "pop"); ivs("probabilityOfThunder", "tst");
+      if (!iv.tst.length && P.weather && P.weather.values){
+        /* the NWS weather grid's thunderstorm coverage words, as chances */
+        const COV = { slight_chance:15, isolated:15, chance:35, scattered:35, occasional:35, likely:65, numerous:65, frequent:65, periods:65, definite:85, widespread:85 };
+        for (const it of P.weather.values){
+          const [st, d] = String(it.validTime).split("/"), a = Date.parse(st); let p = 0;
+          for (const w of it.value || []) if (w && /thunder/.test(w.weather || "")) p = Math.max(p, COV[w.coverage] || 25);
+          iv.tst.push({ a, b: a + dur(d)*H, p: p/100 });
+        }
+      }
       /* NDFD gusts are only given when they exceed the wind; keep gust >= sustained */
       for (let i = 0; i < TL.n; i++){ if (m.s10[i] != null && (m.g10[i] == null || m.g10[i] < m.s10[i])) m.g10[i] = m.s10[i]; }
       /* fire weather: NDFD mixing height and transport wind stand in for the model fields */
@@ -679,6 +690,11 @@ class SiteGuidance {
     if (s.iv){
       if (ev === "tst" && s.iv.tst4 && s.iv.tst4.length && B - A >= 3*H) p = tiledProb(s.iv.tst4, A, B, 4*H);
       if (p == null) p = intervalProb(s.iv[ev], A, B);
+    }
+    else if (ev === "tst" && PERS && s.members.some(m => m.wc && m.wc.some(v => v != null))){
+      let h = 0, n = 0;
+      for (const m of s.members){ if (!m.wc) continue; let hit = null; for (let t = A; t < B; t += H){ const i = this.TL.idx(t); if (i < 0 || i >= this.TL.n) continue; const v = m.wc[i]; if (v == null) continue; hit = hit || v >= 95; } if (hit == null) continue; h += hit ? 1 : 0; n++; }
+      p = n ? h/n : null;
     }
     else if (ev === "pop"){
       if (s.def.id === "nbm" && s.members[0] && s.members[0].pp.some(v => v != null)) p = nbmPop(s.members[0], A, B, this.TL);

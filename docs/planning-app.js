@@ -519,7 +519,7 @@ function renderExpSetup(){
 let expT = null;
 function expChanged(full){
   savePrefs(); applyExposureConfig(prefs.exp); rebuildViews();
-  clearTimeout(expT); expT = setTimeout(() => { if (full) loadAll(); else rebuildGuidance(); renderExpSetup(); }, full ? 50 : 250);
+  clearTimeout(expT); expT = setTimeout(() => { if (full) loadAll(); else rebuildGuidance(); renderExpSetup(); if (PERSONAL && $("pRangeNote")) $("pRangeNote").textContent = `${S.rows.length} rows · forecast available to ${dtShow(persLimits().hi)}`; }, full ? 50 : 250);
 }
 /* ---------- official schedule (uploaded CSV, kept on this computer) ----------
    One file serves both pages: "ground" rows appear on the exposure page, "launch" rows in the LMEF
@@ -739,6 +739,7 @@ function persSetupHTML(){
       <span class="seg" id="pStep" role="group" aria-label="Rows"><button type="button" data-step="all">Hourly</button><button type="button" data-step="0">3-hourly</button></span>
       <label class="chk"><input type="checkbox" id="pMarine"> Waves and sea state (on the water)</label>
     </div>
+    <p class="mut" id="pRangeNote"></p>
   </section>
   <section class="panel perssum" id="persSum" aria-label="Summary">
     <div class="psh"><h3>Summary</h3><span class="mut" id="pSumState"></span><span class="sp"></span><button class="btn ghost" type="button" id="pSumReset">Rewrite from the forecast</button></div>
@@ -768,7 +769,7 @@ function persSummaryAuto(){
     else text += " Rain chances stay low.";
   }
   const lt = lti >= 0 ? o[lk][lti] : null;
-  if (lt != null && lt >= 15){ text += ` Thunderstorms are possible (${Math.round(lt)}% around ${when(lti)}); head indoors at the first rumble.`; conc.push(`Thunderstorms possible around ${when(lti)} (${Math.round(lt)}%)`); }
+  if (lt != null && lt >= 15){ const w = lt >= 60 ? "likely" : "possible"; text += ` Thunderstorms are ${w} (${Math.round(lt)}% around ${when(lti)}); head indoors at the first rumble.`; conc.push(`Thunderstorms ${w} around ${when(lti)} (${Math.round(lt)}%)`); }
   if (si >= 0){
     const sm = Math.round(mph(o.s33[si])), gm = gi >= 0 ? Math.round(mph(o.g33[gi])) : null, d = o.dir && o.dir[si] != null ? compassWord(o.dir[si]) : "";
     text += ` Winds peak around ${sm} mph${d ? ` from the ${d}` : ""}${gm ? ` with gusts near ${gm} mph` : ""} around ${when(si)}.`;
@@ -797,8 +798,14 @@ function renderPersSummary(){
   $("pSumState").textContent = sm.edited ? "edited by you" : "written from the forecast; edit it as you like";
   $("pSumReset").hidden = !sm.edited;
 }
-function renderPersSetup(){
-  const e = prefs.exp, ae = document.activeElement, set = (id, v) => { if ($(id) !== ae) $(id).value = v ?? ""; };
+/* the time the forecast covers: from a few hours ago to about 7½ days out */
+function persLimits(){ const lo = Math.floor(Date.now()/H)*H - 3*H, hi = S.TL ? Math.min(S.TL.t0 + (S.TL.n - 2)*H, Math.floor((Date.now() + 7.5*24*H)/H)*H) : Math.floor((Date.now() + 7.5*24*H)/H)*H; return { lo, hi }; }
+const dtShow = t => { const p = lp(t), h = p.h % 12 || 12; return `${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][new Date(Date.UTC(p.y, p.mo - 1, p.d)).getUTCDay()]} ${p.mo}/${p.d} ${h}${p.mi ? ":" + pad2(p.mi) : ""} ${p.h < 12 ? "am" : "pm"}`; };
+function renderPersSetup(force){
+  const e = prefs.exp, ae = document.activeElement, set = (id, v) => { if (force || $(id) !== ae) $(id).value = v ?? ""; };
+  /* the calendar only offers times the forecast covers */
+  const lim = persLimits(); ["pStart", "pEnd"].forEach(id => { $(id).min = dtInput(lim.lo); $(id).max = dtInput(lim.hi); $(id).step = 3600; });
+  if ($("pRangeNote")) $("pRangeNote").textContent = `${S.rows ? S.rows.length : 0} rows · forecast available to ${dtShow(lim.hi)}`;
   set("pTitle", e.title); set("pName", e.place && e.place.name); set("pLat", e.place && (+e.place.lat).toFixed(4)); set("pLon", e.place && (+e.place.lon).toFixed(4));
   set("pStart", dtInput(e.start)); set("pEnd", dtInput(e.end)); $("pMarine").checked = !!e.marine;
   document.querySelectorAll("#pStep button").forEach(b => b.setAttribute("aria-pressed", String(b.dataset.step) === String(e.hourly === "all" ? "all" : "0")));
@@ -852,10 +859,32 @@ function bindPersonal(){
   $("pFindGo").onclick = find; $("pFind").onkeydown = ev => { if (ev.key === "Enter"){ ev.preventDefault(); find(); } };
   $("pUseLL").onclick = () => setPlace($("pLat").value, $("pLon").value, $("pName").value && $("pName").value !== prefs.exp.place.name ? $("pName").value : null);
   $("pMapBtn").onclick = () => { if ($("pMapWrap").hidden) openMap(); else $("pMapWrap").hidden = true; };
-  const range = () => { const a = dtParse($("pStart").value), b = dtParse($("pEnd").value); if (a == null || b == null) return; if (b <= a + H){ toast("The end has to be after the start"); renderPersSetup(); return; }
-    const lo = Math.floor(Date.now()/H)*H - 6*H, hi = Date.now() + 7.5*24*H; prefs.exp.start = Math.max(a, lo); prefs.exp.end = Math.min(b, hi); if (b > hi) toast("The forecast goes out about 7½ days; the end was moved in"); expChanged(false); };
-  $("pStart").onchange = range; $("pEnd").onchange = range;
-  $("pQuick").onclick = ev => { const b = ev.target.closest("[data-h]"); if (!b) return; const st = Math.ceil(Date.now()/H)*H; prefs.exp.start = st; prefs.exp.end = st + (+b.dataset.h)*H; expChanged(false); renderPersSetup(); };
+  /* dates: applied a moment after you stop typing, kept inside the forecast, and the end moves with
+     the start so the length of the window is kept; the fields always show what the forecast uses */
+  let rangeT = null;
+  const range = which => {
+    clearTimeout(rangeT);
+    rangeT = setTimeout(() => {
+      const e = prefs.exp, lim = persLimits();
+      let a = dtParse($("pStart").value), b = dtParse($("pEnd").value);
+      if (a == null || b == null) return;
+      const len = Math.max(H, (e.end - e.start) || 24*H), notes = [];
+      a = Math.round(a/H)*H; b = Math.round(b/H)*H;
+      if (a < lim.lo){ a = lim.lo; notes.push("the start was moved up to now"); }
+      if (a > lim.hi - H){ a = lim.hi - H; notes.push("the start was moved back inside the forecast"); }
+      if (which === "start" && b <= a) b = a + len;
+      if (b <= a){ a = b - len; if (a < lim.lo){ a = lim.lo; } if (b <= a) b = a + H; notes.push("the start was moved before the end"); }
+      if (b > lim.hi){ b = lim.hi; notes.push(`the forecast only reaches ${dtShow(lim.hi)}, so the end was moved in`); }
+      if (b <= a) b = Math.min(lim.hi, a + H);
+      e.start = a; e.end = b;
+      $("pStart").value = dtInput(a); $("pEnd").value = dtInput(b);
+      if (notes.length) toast(notes[0].charAt(0).toUpperCase() + notes.join("; ").slice(1));
+      expChanged(false);
+    }, which === "blur" ? 0 : 700);
+  };
+  $("pStart").addEventListener("input", () => range("start")); $("pEnd").addEventListener("input", () => range("end"));
+  $("pStart").addEventListener("change", () => range("start")); $("pEnd").addEventListener("change", () => range("end"));
+  $("pQuick").onclick = ev => { const b = ev.target.closest("[data-h]"); if (!b) return; const lim = persLimits(), st = Math.max(lim.lo, Math.ceil(Date.now()/H)*H); prefs.exp.start = st; prefs.exp.end = Math.min(lim.hi, st + (+b.dataset.h)*H); expChanged(false); renderPersSetup(true); };
   $("pStep").onclick = ev => { const b = ev.target.closest("[data-step]"); if (!b) return; prefs.exp.hourly = b.dataset.step === "all" ? "all" : "0"; expChanged(false); renderPersSetup(); };
   $("pMarine").onchange = ev => { prefs.exp.marine = ev.target.checked; prefs.exp.summary = null; prefs.exp.concerns = null; expChanged(true); };
   $("pConc").oninput = ev => { prefs.exp.concerns = ev.target.value.split("\n").map(x => x.trim()).filter(Boolean); savePrefs(); renderPersSummary(); };
@@ -989,7 +1018,8 @@ function renderStatus(){
   if (DEMO){ b.className = "banner show demo"; b.textContent = "Demo mode: every value on this page is synthetic. Remove ?demo=1 from the address to load real guidance."; }
   else if (!S.loading && ok === 0){ b.className = "banner show"; b.textContent = "Couldn't reach any guidance source from this browser. Check the network connection, then press Refresh guidance. You can still type a forecast into the table."; }
   else if (!S.loading && ![...OM_DET, ...OM_ENS].some(d => (S.status[d.id] || {}).ok)){ b.className = "banner show"; b.textContent = "Model guidance from Open-Meteo didn't load, so only MOS and LAMP are showing. Press Refresh guidance to try again."; }
-  else if (!S.loading && !["lav","mav","nbs","met","mex","nbe","hrefct","refsct"].some(id => (S.status[id] || {}).ok)){ b.className = "banner show"; b.textContent = "No thunder guidance loaded (calibrated thunder, LAMP or MOS), so lightning probabilities are blank. Fill them in by hand, or check that the MOS mirror and high-res workflows are running."; }
+  else if (PERSONAL && !S.loading && OF && OF.o && ["lt1","lt3","lt6"].every(k => !OF.o[k] || OF.o[k].every(v => v == null))){ b.className = "banner show"; b.textContent = "No thunder guidance for this place, so the thunder rows are blank. Fill them in by hand if needed."; }
+  else if (!PERSONAL && !S.loading && !["lav","mav","nbs","met","mex","nbe","hrefct","refsct"].some(id => (S.status[id] || {}).ok)){ b.className = "banner show"; b.textContent = "No thunder guidance loaded (calibrated thunder, LAMP or MOS), so lightning probabilities are blank. Fill them in by hand, or check that the MOS mirror and high-res workflows are running."; }
   else b.className = "banner";
 }
 
